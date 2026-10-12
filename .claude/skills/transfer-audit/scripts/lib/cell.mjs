@@ -542,6 +542,13 @@ function completionOf(done, side, ev) {
         exitCode: d.exitCode ?? null,
         kind: d.kind,
         ok: d.ok,
+        // What the side itself said about the per-file SHA-256 every transfer
+        // carries since v1.11.0: the CLI's Verified row (lib/cli.mjs
+        // parseSummary) or the web app's own line (lib/web.mjs
+        // TEXT.verifiedLine), else null. Evidence only: verifyAttempt
+        // compares the hashes itself and never reads this, so a release that
+        // prints nothing passes as it always did.
+        verified: d.detail?.verified ?? null,
         // True when the driver wrote this completion instead of observing
         // it, so no reader mistakes it for something the surface reported.
         synthesized: d.detail?.synthesized ?? false,
@@ -1251,6 +1258,9 @@ export async function runAttempt(
         rec.signature = classifySignature(evText, {
             relay: cell.path === 'REL',
             turnHeavy,
+            // One desktop line stands for the peer wait and for the ack
+            // wait; the phase tells them apart (lib/triage.mjs).
+            phase: rec.failedPhase,
         });
         if (e.signatureKey) {
             // A keyed PhaseError names the whole signature, not just its key:
@@ -1598,10 +1608,13 @@ export async function runCell(cell, ctx) {
                 new SafetyError(a.error?.message || 'safety invariant tripped')
             );
         if (a.skipReason)
+            // Only uia-setvalue has a row in references/triage.md; any other
+            // run-time SKIP (desktop-savedir, present, a request cell's own
+            // stops) is a precondition whose reason is the whole account.
             return [
                 'SKIP',
                 a.skipReason,
-                'uia-setvalue',
+                a.skipReason === 'uia-setvalue' ? 'uia-setvalue' : null,
                 a.error?.message || a.skipReason,
             ];
         if (a.harness)
@@ -1683,6 +1696,19 @@ export async function runCell(cell, ctx) {
         );
     }
     const [v2, k2, t2, n2] = failureOf(b);
+    // A retry that could not run (the day's request links were spent before
+    // it made its own, the owner came back) says nothing about the attempt
+    // it was retrying. Attempt 1's FAIL stays the cell's verdict, with the
+    // reason the retry was skipped in the note: ending SKIP here left a real
+    // failure in `attempts` only.
+    if (v2 === 'SKIP')
+        return finish(
+            'FAIL',
+            key,
+            triage,
+            `${note}; the retry could not run (SKIP ${k2}: ${n2})`,
+            a
+        );
     return finish(v2, k2, t2, n2, b);
 }
 

@@ -31,6 +31,7 @@ import {
     probeWsl,
     profileLine,
     purgeRunData,
+    readProbe,
     serverFeaturesRow,
     serverFor,
     webHeadLabel,
@@ -1813,6 +1814,298 @@ test('head profile --desktop wailsdev calls desktop.buildHead and gates no deskt
         readFileSync(path.join(outDir, 'probe.json'), 'utf8')
     );
     assert.match(probe.motw.detail, /^n\/a/);
+});
+
+// B4: the head run is the only caller that starts the stack, and it asks for
+// request links every time: the plan is not known yet when the stack starts,
+// and the flag only makes the local server list request-1.
+test('a head run that resolves its own infra starts the stack with requestLinks: true', async () => {
+    const world = fakeWorld();
+    const i = headIo(world, { infra: undefined, infraRows: undefined });
+    const asked = [];
+    const ensure = i.adapters.stack.ensureStack;
+    i.adapters.stack.ensureStack = async (o = {}) => {
+        asked.push(o);
+        return ensure(o);
+    };
+    const outDir = out('head-stack-flags');
+    const code = await main(headArgs(outDir), { ...i, cellHook: shrink });
+    assert.equal(code, 0, i.lines.concat(i.errors).join('\n'));
+    assert.equal(asked.length, 1, 'the stack is ensured once');
+    assert.equal(asked[0].requestLinks, true);
+    assert.equal(asked[0].relaxed, true);
+    assert.equal(
+        'localTurn' in asked[0],
+        false,
+        'never --local-turn on its own'
+    );
+});
+
+// B5: probe.json was reused on its age alone, so a wailsdev run after a Store
+// probe was gated by the Store lane's receiverDrivable and present.
+test('readProbe reuses probe.json only for the --desktop value and profile it was taken for', () => {
+    const dir = out('read-probe');
+    mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'probe.json');
+    const write = (p) => writeFileSync(file, JSON.stringify(p));
+    const logs = [];
+    const log = (l) => logs.push(l);
+    const fresh = {
+        at: new Date().toISOString(),
+        desktop: { mode: 'store', receiverDrivable: false },
+        requested: { desktop: 'store', profile: 'shipped' },
+    };
+    write(fresh);
+    const same = readProbe(dir, log, { desktop: 'store', profile: 'shipped' });
+    assert.equal(
+        same?.desktop.mode,
+        'store',
+        'the same lane and profile reuse it'
+    );
+    assert.deepEqual(logs, []);
+
+    // Another lane, then another profile.
+    assert.equal(
+        readProbe(dir, log, { desktop: 'wailsdev', profile: 'shipped' }),
+        null
+    );
+    assert.match(
+        logs.at(-1),
+        /taken for --desktop store --profile shipped, not --desktop wailsdev --profile shipped; re-probing/
+    );
+    assert.equal(
+        readProbe(dir, log, { desktop: 'store', profile: 'head' }),
+        null
+    );
+    assert.match(logs.at(-1), /not --desktop store --profile head; re-probing/);
+
+    // The REQUESTED value is compared, never the lane auto resolved to: a
+    // probe taken for auto that landed on the Store build is not a probe an
+    // explicit --desktop store asked for, and the reverse.
+    write({ ...fresh, requested: { desktop: 'auto', profile: 'shipped' } });
+    assert.ok(readProbe(dir, log, { desktop: 'auto', profile: 'shipped' }));
+    assert.equal(
+        readProbe(dir, log, { desktop: 'store', profile: 'shipped' }),
+        null
+    );
+    write(fresh);
+    assert.equal(
+        readProbe(dir, log, { desktop: 'auto', profile: 'shipped' }),
+        null
+    );
+
+    // A file from before the field existed, or with half of it.
+    const { requested, ...old } = fresh;
+    void requested;
+    write(old);
+    assert.equal(
+        readProbe(dir, log, { desktop: 'store', profile: 'shipped' }),
+        null
+    );
+    assert.match(
+        logs.at(-1),
+        /does not record the --desktop and --profile it was taken for; re-probing/
+    );
+    write({ ...fresh, requested: { desktop: 'store' } });
+    assert.equal(
+        readProbe(dir, log, { desktop: 'store', profile: 'shipped' }),
+        null
+    );
+
+    // The age rule is unchanged, and so are a missing and an unreadable file.
+    write({
+        ...fresh,
+        at: new Date(Date.now() - 25 * 3600 * 1000).toISOString(),
+    });
+    assert.equal(
+        readProbe(dir, log, { desktop: 'store', profile: 'shipped' }),
+        null
+    );
+    assert.match(logs.at(-1), /h old; re-probing/);
+    writeFileSync(file, '{not json');
+    assert.equal(
+        readProbe(dir, log, { desktop: 'store', profile: 'shipped' }),
+        null
+    );
+    assert.equal(
+        readProbe(out('read-probe-missing'), log, {
+            desktop: 'store',
+            profile: 'shipped',
+        }),
+        null
+    );
+});
+
+// The same --desktop value can mean another lane a day later: `auto` follows
+// the Store app, which may have been updated, gone stale or been removed
+// since the probe was taken, and the desktop half of a probe is one lane's
+// answer. The probe records the lane it resolved, and a run that resolved
+// another one probes again.
+test('readProbe drops a probe whose --desktop value now resolves to another lane, and a probe records the lane it resolved', async () => {
+    const dir = out('read-probe-lane');
+    mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'probe.json');
+    const logs = [];
+    const log = (l) => logs.push(l);
+    const write = (extra) =>
+        writeFileSync(
+            file,
+            JSON.stringify({
+                at: new Date().toISOString(),
+                requested: { desktop: 'auto', profile: 'shipped' },
+                desktop: { mode: 'store', receiverDrivable: true },
+                ...extra,
+            })
+        );
+    const auto = { desktop: 'auto', profile: 'shipped' };
+
+    write({ resolved: { desktop: 'store' } });
+    assert.ok(
+        readProbe(dir, log, { ...auto, lane: 'store' }),
+        'the same lane reuses it'
+    );
+    assert.ok(
+        readProbe(dir, log, auto),
+        'a caller that names no lane is not second-guessed'
+    );
+    assert.ok(
+        readProbe(dir, log, { ...auto, lane: null }),
+        'nor is a run with no desktop build'
+    );
+    assert.deepEqual(logs, []);
+    assert.equal(readProbe(dir, log, { ...auto, lane: 'portable' }), null);
+    assert.equal(
+        logs.at(-1),
+        'probe.json was taken when --desktop auto resolved to store; it now resolves to portable; re-probing'
+    );
+
+    // A file from before the lane was recorded still says it in desktop.mode.
+    write({});
+    assert.ok(readProbe(dir, log, { ...auto, lane: 'store' }));
+    assert.equal(readProbe(dir, log, { ...auto, lane: 'portable' }), null);
+    // A probe that never resolved its lane (the desktop half failed) is not
+    // one any lane can reuse.
+    write({ desktop: { mode: 'auto' } });
+    assert.equal(readProbe(dir, log, { ...auto, lane: 'store' }), null);
+    assert.match(
+        logs.at(-1),
+        /resolved to an unrecorded lane; it now resolves to store; re-probing/
+    );
+
+    // An explicit lane names itself, and the request is still compared first.
+    write({
+        requested: { desktop: 'portable', profile: 'shipped' },
+        desktop: { mode: 'portable' },
+        resolved: { desktop: 'portable' },
+    });
+    assert.ok(
+        readProbe(dir, log, {
+            desktop: 'portable',
+            profile: 'shipped',
+            lane: 'portable',
+        })
+    );
+    assert.equal(readProbe(dir, log, { ...auto, lane: 'portable' }), null);
+    assert.match(
+        logs.at(-1),
+        /taken for --desktop portable --profile shipped, not --desktop auto/
+    );
+
+    // The probe subcommand writes the lane `auto` resolved to beside what was
+    // asked: the Store build when the package is installed and no build was
+    // resolved for it, or the lane of the build it was handed.
+    const json = (body) =>
+        new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+        });
+    const fetchImpl = async (url) =>
+        String(url).endsWith('/health')
+            ? json({ status: 'healthy', uptime: 5 })
+            : json({ iceServers: [{ urls: ['stun:x:3478'] }] });
+    for (const [builds, lane] of [
+        [null, 'store'],
+        [BUILDS, 'portable'],
+    ]) {
+        const adapters = makeFakeAdapters(fakeWorld());
+        const desktop = {
+            ...adapters.desktop,
+            storePackage: async () => ({ present: true, version: '1.3.0.0' }),
+        };
+        const i = io(fakeWorld(), {
+            fetchImpl,
+            builds,
+            tryAdapter: async (name) =>
+                name === 'desktop' ? desktop : (adapters[name] ?? null),
+        });
+        const outDir = out(`read-probe-lane-${lane}`);
+        assert.equal(
+            await main(
+                ['probe', '--profile', 'head', '--root', root, '--out', outDir],
+                i
+            ),
+            0,
+            i.lines.concat(i.errors).join('\n')
+        );
+        const probe = JSON.parse(
+            readFileSync(path.join(outDir, 'probe.json'), 'utf8')
+        );
+        assert.deepEqual(probe.requested, { desktop: 'auto', profile: 'head' });
+        assert.deepEqual(probe.resolved, { desktop: lane });
+        assert.equal(probe.desktop.mode, lane);
+    }
+});
+
+test('a run on another lane re-probes instead of reusing probe.json, and the file records what was requested', async () => {
+    const world = fakeWorld();
+    const i = headIo(world);
+    const probed = [];
+    const probe = i.adapters.desktop.probe;
+    i.adapters.desktop.probe = async (o = {}) => {
+        probed.push(o.mode);
+        return probe(o);
+    };
+    const outDir = out('probe-lane');
+    assert.equal(
+        await main(
+            [
+                'probe',
+                '--profile',
+                'head',
+                '--desktop',
+                'store',
+                '--root',
+                root,
+                '--out',
+                outDir,
+            ],
+            i
+        ),
+        0,
+        i.lines.concat(i.errors).join('\n')
+    );
+    const read = () =>
+        JSON.parse(readFileSync(path.join(outDir, 'probe.json'), 'utf8'));
+    assert.deepEqual(read().requested, { desktop: 'store', profile: 'head' });
+    assert.equal(read().desktop.mode, 'store');
+
+    const code = await main(headArgs(outDir), { ...i, cellHook: shrink });
+    assert.equal(code, 0, i.lines.concat(i.errors).join('\n'));
+    assert.deepEqual(
+        probed,
+        ['store', 'wailsdev'],
+        'the wailsdev run probed its own lane'
+    );
+    assert.deepEqual(read().requested, {
+        desktop: 'wailsdev',
+        profile: 'head',
+    });
+    assert.equal(read().desktop.mode, 'wailsdev');
+    const log = readFileSync(path.join(headRunDir(outDir), 'log.txt'), 'utf8');
+    assert.match(
+        log,
+        /probe\.json was taken for --desktop store --profile head, not --desktop wailsdev --profile head; re-probing/
+    );
 });
 
 test('a desktop adapter without buildHead still logs the pending line and skips desktop cells', async () => {

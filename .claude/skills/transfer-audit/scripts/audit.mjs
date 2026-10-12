@@ -829,6 +829,10 @@ async function runProbes({ opts, io, ledger, fence, log, builds, versions }) {
     const pending = [];
     const probe = {
         at: new Date().toISOString(),
+        // What the command line asked for, which is what readProbe compares.
+        // desktop.mode below ends up as the lane `auto` resolved to, so it
+        // cannot tell an auto run from an explicit one.
+        requested: { desktop: opts.desktop, profile: opts.profile },
         turn: { prod: null, local: null },
         browserRelay: { ok: null, detail: 'pending' },
         desktop: {
@@ -976,6 +980,13 @@ async function runProbes({ opts, io, ledger, fence, log, builds, versions }) {
     // test, else the staged portable exe the desktop probe found.
     const motwExe = builds?.desktop?.path ?? probe.desktop?.portableExe ?? null;
     probe.motw = probeMotw(exec, motwExe, fence, { desktopMode: opts.desktop });
+    // The lane the desktop half answered for, beside what was asked: `auto`
+    // is a request, not a lane, and what it resolves to can change between
+    // a probe and a run (readProbe). null when the lane was never resolved.
+    const lane = probe.desktop?.mode;
+    probe.resolved = {
+        desktop: typeof lane === 'string' && lane !== 'auto' ? lane : null,
+    };
     return probe;
 }
 
@@ -1031,7 +1042,17 @@ function headShas(opts, exec, io = {}) {
     return { localSha7: rootSha7, webLocalSha7: web.sha7 };
 }
 
-function readProbe(outDir, log) {
+/**
+ * probe.json under --out, or null when it must not be reused: older than
+ * 24 h, taken for another --desktop value or profile, or taken when that
+ * value resolved to another lane than opts.lane. The desktop half of a
+ * probe is one lane's answer (receiverDrivable, saveDirSettable, present), so
+ * a wailsdev run that read a Store probe was gated by the Store app. A file
+ * that does not say what it was taken for (written before `requested`
+ * existed) is not reused either. The cost is a re-probe on every lane
+ * switch, and a desktop probe opens the Floe window.
+ */
+export function readProbe(outDir, log, opts = {}) {
     const file = path.join(outDir, 'probe.json');
     if (!existsSync(file)) return null;
     try {
@@ -1039,6 +1060,43 @@ function readProbe(outDir, log) {
         const ageMin = (Date.now() - Date.parse(p.at || 0)) / 60000;
         if (ageMin > 24 * 60) {
             log(`probe.json is ${Math.round(ageMin / 60)} h old; re-probing`);
+            return null;
+        }
+        const was = p.requested;
+        if (
+            !was ||
+            typeof was.desktop !== 'string' ||
+            typeof was.profile !== 'string'
+        ) {
+            log(
+                'probe.json does not record the --desktop and --profile it was taken for; re-probing'
+            );
+            return null;
+        }
+        // The same request can be another lane by now: `auto` follows the
+        // Store app, which may have been updated, gone stale or been removed
+        // since the probe. Compared only when the caller knows the lane it
+        // will drive (a run, once its builds are resolved) and the request
+        // itself is the same; a request that differs is said just below.
+        const wasLane =
+            [p.resolved?.desktop, p.desktop?.mode].find(
+                (l) => typeof l === 'string' && l !== 'auto'
+            ) ?? null;
+        if (
+            was.desktop === opts.desktop &&
+            was.profile === opts.profile &&
+            typeof opts.lane === 'string' &&
+            wasLane !== opts.lane
+        ) {
+            log(
+                `probe.json was taken when --desktop ${was.desktop} resolved to ${wasLane ?? 'an unrecorded lane'}; it now resolves to ${opts.lane}; re-probing`
+            );
+            return null;
+        }
+        if (was.desktop !== opts.desktop || was.profile !== opts.profile) {
+            log(
+                `probe.json was taken for --desktop ${was.desktop} --profile ${was.profile}, not --desktop ${opts.desktop} --profile ${opts.profile}; re-probing`
+            );
             return null;
         }
         return p;
@@ -1331,6 +1389,11 @@ async function resolveInfra({ opts, io, ledger, log, manifest, safety }) {
             root: opts.root,
             clientDir: opts.clientDir,
             relaxed: opts.relaxed,
+            // Always asked for: the plan is not known yet, and the flag only
+            // makes the local server list request-1. A reused stack keeps
+            // whatever it was started with; probe P10 is read fresh on every
+            // run, so the plan gates the request cells on what is served.
+            requestLinks: true,
             evidenceDir: path.join(manifest.runDir, 'stack'),
             log,
         });
@@ -1996,7 +2059,14 @@ export async function runCmd(opts, io = {}) {
         });
 
         // Probes (P3-P5, P7 here; the rest through the desktop adapter).
-        let probe = io.probe ?? readProbe(opts.out, log);
+        // With the lane this run's builds resolved to: a probe taken when
+        // the same --desktop value meant another lane is not reused.
+        let probe =
+            io.probe ??
+            readProbe(opts.out, log, {
+                ...opts,
+                lane: builds?.desktop?.launch ?? null,
+            });
         if (!probe) {
             probe = await runProbes({
                 opts,

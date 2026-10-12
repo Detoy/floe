@@ -14,10 +14,10 @@ import { after, test } from 'node:test';
 
 import { runCell } from './cell.mjs';
 import { ACCEPT_WAIT_MS, PlaywrightDriver } from './desktop.mjs';
-import { cellPlan } from './matrix.mjs';
+import { SKIP_REASONS, cellPlan } from './matrix.mjs';
 import { Ledger } from './pacing.mjs';
 import { buildRunJson, newSafety, renderMarkdown } from './report.mjs';
-import { AWAY_ONLY, scrubDeep } from './request.mjs';
+import { AWAY_ONLY, DAILY_LIMIT, scrubDeep } from './request.mjs';
 import { SafetyError } from './surfaces.mjs';
 import { FAKE_ROOM } from './tests/fake-request-dom.mjs';
 import { fakeWorld, makeFakeAdapters } from './tests/fake-legs.mjs';
@@ -690,6 +690,75 @@ const EXE_BUILD = (surface) => ({
     launch: surface === 'desktop' ? 'portable' : undefined,
 });
 
+// The server makes 20 links per network address per day
+// (REQUEST_CREATES_PER_DAY in server/server.js) and answers the next Make link
+// with `limited`. That is this machine's budget running out, not a product
+// defect: it used to read FAIL request-flow, once per request cell left in the
+// run, each of them launching the host to learn the same thing.
+test("the server's daily create refusal (limited) is SKIP request-daily-limit, on both host lanes, and later request cells SKIP before their host launches", async () => {
+    const shared = {};
+    const w = fakeRequestWorld({ host: { makeError: 'limited' } });
+    const ctx = ctxFor(w, { shared });
+    const r = await runCell(small('H-DIR-W2D-req'), ctx);
+    assert.equal(r.verdict, 'SKIP', r.note);
+    assert.equal(r.reason, DAILY_LIMIT);
+    assert.equal(r.triage, null, 'a SKIP names no triage row');
+    assert.match(r.note, /20 request links a day/);
+    assert.equal(r.attempts.length, 1, 'never retried');
+    assert.equal(r.attempts[0].failedPhase, 'host.start');
+    assert.equal(clicksOf(w, 'Make link').length, 1);
+    assert.equal(w.visitors.length, 0, 'no visitor was opened');
+    assert.equal(w.dom.closed, true, 'the host was stopped');
+    assert.equal(shared.requestLimited, true);
+    assert.ok(
+        SKIP_REASONS[DAILY_LIMIT],
+        'the reason has its line in the legend'
+    );
+
+    // The next request cell of the run: nothing launches, on an exe host too.
+    const w2 = fakeRequestWorld({ lane: 'uia' });
+    const ctx2 = ctxFor(w2, { shared, buildFor: EXE_BUILD, userAway: true });
+    const r2 = await runCell(small('H-DIR-W2D-reqdecline'), ctx2);
+    assert.equal(r2.verdict, 'SKIP', r2.note);
+    assert.equal(r2.reason, DAILY_LIMIT);
+    assert.equal(w2.launchEdits.length, 0, 'nothing launched');
+    assert.equal(w2.dom.clicks.length, 0);
+    assert.equal(w2.visitors.length, 0);
+
+    // TA-17 makes a link too: its quick cell never starts a leg.
+    const w3 = fakeRequestWorld();
+    const r3 = await runCell(
+        small('H-DIR-W2W-reqopen'),
+        ctxFor(w3, { shared })
+    );
+    assert.equal(r3.verdict, 'SKIP', r3.note);
+    assert.equal(r3.reason, DAILY_LIMIT);
+    assert.equal(r3.attempts[0].phases['sender.start'], undefined);
+    assert.equal(w3.dom.clicks.length, 0);
+
+    // The UIA lane reads the same refusal from the error view's fixed copy.
+    const w4 = fakeRequestWorld({
+        lane: 'uia',
+        host: { makeError: 'limited' },
+    });
+    const ctx4 = ctxFor(w4, { buildFor: EXE_BUILD, userAway: true });
+    const r4 = await runCell(small('H-DIR-W2D-req'), ctx4);
+    assert.equal(r4.verdict, 'SKIP', r4.note);
+    assert.equal(r4.reason, DAILY_LIMIT);
+    assert.equal(
+        ctx4.shared.requestLimited,
+        true,
+        'a run without a shared record gets one'
+    );
+
+    // Any other Make link error stays the finding it was.
+    const w5 = fakeRequestWorld({ faults: ['make-error'] });
+    const r5 = await runCell(small('H-DIR-W2D-req'), ctxFor(w5));
+    assert.equal(r5.verdict, 'FAIL', r5.note);
+    assert.equal(r5.reason, 'request-flow');
+    assert.match(r5.note, /Make link ended in error \(disabled\)/);
+});
+
 test('an exe host without --user-away SKIPs request-host-away-only before anything opens, in the plan and in the runner (G2-F1)', async () => {
     const w = fakeRequestWorld({ lane: 'uia' });
     const ctx = ctxFor(w, { buildFor: EXE_BUILD });
@@ -1125,4 +1194,32 @@ test('TA-14 never fronts a server that is not loopback, whatever reached the run
     );
     assert.equal(w.caddies.length, 0, 'no Caddy started');
     assert.equal(w.dom.clicks.length, 0, 'no host driven');
+});
+
+// The same order in a real request cell: attempt 1 FAILs on a retryable
+// signature (the visitor's page never loaded), the day's 20 links run out
+// before the retry makes its own, and the retry is refused before its host
+// launches. The cell is the FAIL it was, never SKIP request-daily-limit.
+test("a request cell whose retry is refused its link for the day keeps attempt 1's FAIL as its verdict, with the refusal in the note", async () => {
+    const w = fakeRequestWorld({ faults: ['goto-error'] });
+    const ctx = ctxFor(w, { shared: {} });
+    const log = ctx.log;
+    ctx.log = (l) => {
+        // runCell logs this between the two attempts.
+        if (/retrying once after|for the window to drain/.test(l))
+            ctx.shared.requestLimited = true;
+        log(l);
+    };
+    const r = await runCell(small('H-DIR-W2D-req'), ctx);
+    assert.equal(r.attempts.length, 2, r.note);
+    assert.equal(r.verdict, 'FAIL', r.note);
+    assert.equal(r.reason, 'goto-timeout');
+    assert.match(r.note, /page\.goto: net::ERR_CONNECTION_REFUSED/);
+    assert.match(
+        r.note,
+        /; the retry could not run \(SKIP request-daily-limit: /
+    );
+    assert.equal(r.attempts[1].failedPhase, 'host.start');
+    assert.equal(clicksOf(w, 'Make link').length, 1, 'the retry made no link');
+    assertNoRoom(ctx, r, 'H-DIR-W2D-req');
 });

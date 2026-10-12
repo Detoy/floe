@@ -70,8 +70,10 @@
  *   or WSL scratch under /var/tmp/floe-lta. Sizes are lower bounds on a
  *   pnpm tree, where node_modules is mostly links into a shared store, and
  *   a trailing + marks a size that stopped counting. The reported extras
- *   (go build cache, stashes, local-only branches, worktrees) are
- *   read-only notes and are never swept.
+ *   (go build cache, stashes, local-only branches, worktrees, branches
+ *   already on origin/main, other clones of this repository) are read-only
+ *   notes and are never swept: they are not candidates, so no flag reaches
+ *   them.
  *
  * Usage:
  *   node .claude/skills/deep-clean/scripts/deep-clean.mjs survey [options]
@@ -250,11 +252,15 @@ function denyList(roots, tempRoot) {
             path: path.join(localapp, 'ms-playwright'),
             why: 'shared Playwright browser install',
         },
-        // The stable operator --bin-dir. Deleting it re-arms the Windows
-        // firewall consent dialog on the next audit round.
+        // The stable operator --bin-dir. A Windows Firewall rule is bound to
+        // an exe path, so a binary rebuilt at a new path starts with none.
+        // Until 2026-09-16 that raised the consent dialog on the next audit
+        // round. The dialog is off on this machine since then, and the new
+        // path's inbound is blocked without a prompt (event 2011), which an
+        // audit reads as connect-timeout.
         {
             path: path.join(tempRoot, 'floe-audit', 'bin'),
-            why: 'stable operator --bin-dir; deleting it re-triggers firewall consent',
+            why: 'stable operator --bin-dir; a binary at a new path has no firewall rule and is blocked without a prompt',
         },
         // Unbacked-up, belong to no repo.
         {
@@ -266,6 +272,34 @@ function denyList(roots, tempRoot) {
             why: 'transcripts and auto memory; use claude project purge instead',
         },
     ];
+    // Where Floe Desktop saves request-link drops unless the owner picks
+    // another folder (requestDefaultDirFn in desktop/requestlink.go). A drop
+    // is somebody's files under the names the sender gave them, so no name
+    // rule can cover it; before this entry the folder was protected only by
+    // sitting outside both allow roots. Generated under every spelling of
+    // the home directory, for the reason makeFence gives: the folder often
+    // does not exist yet, and realpath hands a missing path back as spelled.
+    // The folder's own real path is added too, for a Downloads that is
+    // redirected to another drive.
+    //
+    // defaultReceiveDir in desktop/reveal.go returns the home directory
+    // itself when it has no Downloads folder, so the default drop folder is
+    // then <home>\Floe, and that gets the same rule. It stands down in one
+    // case: a checkout that itself lives at or under that path. A clone made
+    // in the home directory is <home>/floe, which a case-insensitive disk
+    // makes this very folder, and fencing it would refuse every candidate in
+    // that checkout. A drop saved inside such a checkout is an untracked
+    // top-level folder, which is an ask item.
+    const why = 'request-link drops: files somebody sent you, not artifacts';
+    for (const h of spellings(home)) {
+        for (const drops of spellings(path.join(h, 'Downloads', 'Floe'))) {
+            out.push({ path: drops, why });
+        }
+        for (const drops of spellings(path.join(h, 'Floe'))) {
+            if (roots.some((r) => isUnder(r, drops))) continue;
+            out.push({ path: drops, why });
+        }
+    }
     for (const root of new Set(roots.map((r) => path.resolve(r)))) {
         out.push(
             {
@@ -757,6 +791,28 @@ function tempCandidates(rootForms, scratchDays, tempRoot) {
     }
     const stray =
         /^(floe-(doc|win|win-fixed|staged|shipped|head|on|off)\.exe|floe-run-t.*\.log|floeprobe.*|floetrav.*)$/i;
+    // What a test run leaves when it is killed before its own cleanup. Each
+    // pattern is the creator's exact shape and nothing wider, and only a
+    // directory counts. How far the shape can be trusted decides the bucket.
+    // os.MkdirTemp appends digits to its prefix (TestMain in cli/cmd/floe and
+    // in desktop): nobody names a folder floe-cmd-test-home-2333580544 by
+    // hand, so that one is safe by rule, and the age guard holds one a
+    // running test is still writing to. Node's mkdtemp appends six letters or
+    // digits (the transfer-audit cell and request suites), and so does a
+    // person: lta-cell-backup and lta-request-report have exactly that shape.
+    // No pattern tells the two apart, so that one is ask, never safe.
+    const leftovers = [
+        [
+            /^floe-(cmd|desktop)-test-home-\d+$/,
+            'safe',
+            'temporary home of a go test run that did not clean up',
+        ],
+        [
+            /^lta-(cell|request)-[A-Za-z0-9]{6}$/,
+            'ask',
+            'shaped like the temp folder of a transfer-audit test run, and like a name a person would choose; look inside first',
+        ],
+    ];
     for (const e of entries) {
         if (stray.test(e.name)) {
             out.push({
@@ -765,6 +821,19 @@ function tempCandidates(rootForms, scratchDays, tempRoot) {
                 bucket: 'safe',
                 why: 'orphaned build or probe scratch',
                 group: 'tmp-scratch',
+            });
+            continue;
+        }
+        const leftover = e.isDirectory()
+            ? leftovers.find(([re]) => re.test(e.name))
+            : null;
+        if (leftover) {
+            out.push({
+                id: `tmp:${e.name}`,
+                path: path.join(tempRoot, e.name),
+                bucket: leftover[1],
+                why: leftover[2],
+                group: 'tmp-test-leftover',
             });
         }
     }
@@ -786,6 +855,29 @@ function tempCandidates(rootForms, scratchDays, tempRoot) {
                 why: 'transfer-audit evidence, and the manifest cleanup replays; run cleanup first',
             });
         }
+    }
+    // A run folder passed as --out, kept beside the stable bin directory.
+    // Ask, never safe: it holds the manifest transfer-audit cleanup replays
+    // to restore the real desktop.json, and the evidence of the run. bin has
+    // its own deny rule and out its own entry above, so neither is listed
+    // here, and a file is not a run folder.
+    let auditEntries = [];
+    try {
+        auditEntries = fs.readdirSync(path.join(tempRoot, 'floe-audit'), {
+            withFileTypes: true,
+        });
+    } catch {
+        auditEntries = [];
+    }
+    for (const e of auditEntries) {
+        if (!e.isDirectory() || /^(bin|out)$/i.test(e.name)) continue;
+        out.push({
+            id: `audit-run:${e.name}`,
+            path: path.join(tempRoot, 'floe-audit', e.name),
+            bucket: 'ask',
+            why: 'a transfer-audit run folder: its evidence, and the manifest cleanup replays; run cleanup first',
+            group: 'audit-run',
+        });
     }
     out.push(...scratchpadCandidates(rootForms, scratchDays, tempRoot));
     return out;
@@ -875,6 +967,34 @@ function listeners() {
     }
 }
 
+/**
+ * The lines printed under "listeners". floe-run writes a pidfile for the
+ * stack it started, and its stop command acts on that file and nothing else,
+ * so the stop hint is right only while the file exists. Without it the ports
+ * are held by something this checkout's floe-run did not start (another
+ * session's stack, a server run by hand), and sending the reader to stop
+ * would be sending them to a command that has nothing to stop.
+ */
+export function listenerNote(found, pidfileExists) {
+    if (!found.length) return [];
+    const lines = ['\nlisteners (this skill never kills anything)'];
+    for (const l of found) {
+        lines.push(`  :${l.Port} ${l.Proc ?? '?'} pid ${l.Pid}`);
+    }
+    if (pidfileExists) {
+        lines.push(
+            '  owner: node .claude/skills/floe-run/scripts/floe-run.mjs stop'
+        );
+    } else {
+        lines.push(
+            "  no floe-run pidfile: these are not a stack this checkout's floe-run started",
+            '  (another session, or a server run by hand). Nothing here to stop, and this',
+            '  skill never kills anything.'
+        );
+    }
+    return lines;
+}
+
 export function parseFirewall(json) {
     let rows;
     try {
@@ -914,7 +1034,141 @@ function firewallReport() {
     }
 }
 
-/** Read-only notes on state this skill deliberately does not sweep. */
+/** The origin URL in a clone's own config, or null. Reads one file. */
+function originUrlOf(dir) {
+    let text;
+    try {
+        text = fs.readFileSync(path.join(dir, '.git', 'config'), 'utf8');
+    } catch {
+        // No .git, or a .git file: a linked worktree, which git worktree
+        // list reports instead.
+        return null;
+    }
+    const m = /^\[remote "origin"\][^[]*?^\s*url\s*=\s*(.+)$/m.exec(text);
+    if (!m) return null;
+    // git writes a backslash as two, and quotes a value that needs it, so a
+    // Windows path reads C:\\Users\\x in the file.
+    let url = m[1].trim();
+    if (url.length > 1 && url.startsWith('"') && url.endsWith('"')) {
+        url = url.slice(1, -1);
+    }
+    return url.split('\\\\').join('\\').split('\\"').join('"');
+}
+
+const sameUrl = (u) =>
+    (u ?? '')
+        .trim()
+        .replace(/\/+$/, '')
+        .replace(/\.git$/i, '')
+        .toLowerCase();
+
+/**
+ * The folder an origin names when it is a path and not a URL, or null: a
+ * drive path in either slash, a rooted or dotted path, or a file URL. A
+ * clone made from a local clone has such an origin. `from` is the clone the
+ * origin was read in, for a relative one.
+ */
+function localOrigin(url, from) {
+    if (!url) return null;
+    if (/^file:\/\//i.test(url)) {
+        try {
+            return fileURLToPath(url);
+        } catch {
+            return null;
+        }
+    }
+    if (WIN) {
+        // The Git Bash spelling of a drive path, /c/Users/x.
+        const msys = /^\/([A-Za-z])\/(.*)$/.exec(url);
+        if (msys) return path.resolve(`${msys[1]}:/${msys[2]}`);
+        if (/^[A-Za-z]:[\\/]/.test(url)) return path.resolve(url);
+    }
+    return /^(\.{0,2}[\\/])/.test(url) ? path.resolve(from, url) : null;
+}
+
+/**
+ * Other clones of this repository: directories beside the root and directly
+ * under the home directory. Task and lane clones pile up there and nothing
+ * else lists them. Deliberately a list of paths and no more: a clone is
+ * somebody's working tree, possibly with unpushed commits, and it is not
+ * sized because walking a tree another session is deleting leaves a crash
+ * dump behind and makes the deletion fail.
+ *
+ * "Of this repository" is decided by origin, and an origin is not always the
+ * URL: a lane clone made from a local clone names that folder. So a
+ * directory belongs when its origin is a URL some member of the family has,
+ * when its origin is a folder that is a member, when it is the folder a
+ * member was cloned from, or when it was cloned from the same folder as a
+ * member. The family starts as the root alone and the passes repeat until
+ * one adds nothing, because a clone of a clone is only recognized after the
+ * clone it points at. Folders are compared by real path.
+ */
+function siblingClones(root) {
+    const keyOf = (p) => norm(realOrSelf(p));
+    const family = new Set([...spellings(root).map(norm), keyOf(root)]);
+    const urls = new Set();
+    const sources = new Set();
+    const join = (url, from) => {
+        const local = localOrigin(url, from);
+        if (local) sources.add(keyOf(local));
+        else if (sameUrl(url)) urls.add(sameUrl(url));
+    };
+    join(git(root, ['config', '--get', 'remote.origin.url'])?.trim(), root);
+
+    const candidates = [];
+    const seen = new Set();
+    for (const parent of [path.dirname(root), os.homedir()]) {
+        let entries = [];
+        try {
+            entries = fs.readdirSync(parent, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+        for (const e of entries) {
+            if (!e.isDirectory()) continue;
+            const dir = path.join(parent, e.name);
+            const key = keyOf(dir);
+            if (family.has(key) || family.has(norm(dir)) || seen.has(key)) {
+                continue;
+            }
+            const url = originUrlOf(dir);
+            if (!url) continue;
+            seen.add(key);
+            const local = localOrigin(url, dir);
+            candidates.push({
+                dir,
+                key,
+                url,
+                remote: local ? null : sameUrl(url),
+                source: local ? keyOf(local) : null,
+            });
+        }
+    }
+    const out = [];
+    for (let grew = true; grew; ) {
+        grew = false;
+        for (const c of candidates) {
+            if (family.has(c.key)) continue;
+            const belongs =
+                sources.has(c.key) ||
+                (c.remote !== null && urls.has(c.remote)) ||
+                (c.source !== null &&
+                    (family.has(c.source) || sources.has(c.source)));
+            if (!belongs) continue;
+            family.add(c.key);
+            join(c.url, c.dir);
+            out.push(c.dir);
+            grew = true;
+        }
+    }
+    return out.sort();
+}
+
+/**
+ * Read-only notes on state this skill deliberately does not sweep. A note is
+ * not a candidate: it has no id, it is never in the items list, and so no
+ * sweep and no --include can reach what it names.
+ */
 function externals(root) {
     const notes = [];
     const cache =
@@ -950,11 +1204,71 @@ function externals(root) {
             });
         }
     }
-    const wt = git(root, ['worktree', 'list']);
-    if (wt && wt.trim().split(/\r?\n/).length > 1) {
+    const wt = git(root, ['worktree', 'list', '--porcelain']);
+    // Branches some working tree has checked out, this one or a linked one.
+    const checkedOut = new Set();
+    if (wt) {
+        const lines = wt.split(/\r?\n/);
+        const head = 'branch refs/heads/';
+        for (const l of lines) {
+            if (l.startsWith(head)) checkedOut.add(l.slice(head.length).trim());
+        }
+        const trees = lines
+            .filter((l) => l.startsWith('worktree '))
+            .map((l) => l.slice('worktree '.length).trim());
+        if (trees.length > 1) {
+            const self = new Set(spellings(root).map(norm));
+            notes.push({
+                what: 'git worktrees',
+                detail: `${trees.length} checked out`,
+                // Every working tree but the one being surveyed.
+                list: trees.filter(
+                    (t) => !self.has(norm(t)) && !self.has(norm(realOrSelf(t)))
+                ),
+            });
+        }
+    }
+    // Asked only when the ref exists: without it git prints "fatal:
+    // malformed object name origin/main" straight to the reader, and the
+    // answer would be nothing anyway. A branch that any working tree has
+    // checked out is left out: a task branch with no commit yet sits on
+    // origin/main too, and it is anything but finished.
+    const hasMain = git(root, [
+        'rev-parse',
+        '--verify',
+        '--quiet',
+        'refs/remotes/origin/main',
+    ]);
+    const merged = hasMain
+        ? git(root, [
+              'branch',
+              '--merged',
+              'origin/main',
+              '--format=%(HEAD)%(refname:short)',
+          ])
+        : null;
+    if (merged) {
+        const done = merged
+            .split(/\r?\n/)
+            .filter((l) => l.trim() && !l.startsWith('*'))
+            .map((l) => l.trim())
+            .filter(
+                (l) => l !== 'main' && !l.startsWith('(') && !checkedOut.has(l)
+            );
+        if (done.length) {
+            notes.push({
+                what: 'merged branches',
+                detail: `${done.length} local branch(es) with every commit on origin/main; a squash-merged branch never shows here, because its commits are not on main`,
+                list: done,
+            });
+        }
+    }
+    const clones = siblingClones(root);
+    if (clones.length) {
         notes.push({
-            what: 'git worktrees',
-            detail: `${wt.trim().split(/\r?\n/).length} checked out`,
+            what: 'sibling clones',
+            detail: `${clones.length} clone(s) of this repository beside it or under the home directory; never swept, and not sized`,
+            list: clones,
         });
     }
     return notes;
@@ -1129,6 +1443,8 @@ function selfTest(root) {
         [path.join(root, 'client', '.next'), false],
         [path.join(root, 'client', 'playwright-report'), false],
         [path.join(tmp, 'floe-win-fixed.exe'), false],
+        [path.join(home, 'Downloads', 'Floe'), true],
+        [path.join(home, 'Downloads', 'Floe', 'drop', 'photo.jpg'), true],
     ];
     let bad = 0;
     for (const [p, shouldRefuse] of cases) {
@@ -1140,10 +1456,54 @@ function selfTest(root) {
             );
         }
     }
+    // The two Downloads cases above are refused for sitting outside the
+    // allow roots whether or not the Downloads\Floe rule exists. A fence
+    // whose temp root is Downloads takes that accident away: the rule alone
+    // must refuse the folder, and must not reach its neighbor. The home used
+    // here is a name under the temp directory that is never created, so the
+    // answer cannot depend on what the real Downloads folder holds (a link,
+    // a repository) and nothing is written.
+    const pretendHome = path.join(tmp, `deep-clean-self-test-${process.pid}`);
+    const savedHome = {
+        USERPROFILE: process.env.USERPROFILE,
+        HOME: process.env.HOME,
+    };
+    const downloads = path.join(pretendHome, 'Downloads');
+    // [temp root of the fence, path, must the rule refuse it]. The last three
+    // are the fallback folder, <home>\Floe, with the home as the temp root.
+    const byRule = [
+        [downloads, path.join(downloads, 'Floe'), true],
+        [downloads, path.join(downloads, 'Floe', 'drop', 'a.jpg'), true],
+        [downloads, path.join(downloads, 'Floe-old'), false],
+        [pretendHome, path.join(pretendHome, 'Floe'), true],
+        [pretendHome, path.join(pretendHome, 'Floe', 'drop', 'a.jpg'), true],
+        [pretendHome, path.join(pretendHome, 'Floe-old'), false],
+    ];
+    process.env.USERPROFILE = pretendHome;
+    process.env.HOME = pretendHome;
+    try {
+        for (const [tempRoot, p, shouldRefuse] of byRule) {
+            const why = makeFence(root, [], tempRoot)(p);
+            const byTheRule =
+                why !== null && why.startsWith('request-link drops');
+            if (shouldRefuse ? !byTheRule : why !== null) {
+                bad += 1;
+                console.log(
+                    `FAIL ${p}\n     expected ${shouldRefuse ? 'the Downloads/Floe rule' : 'allow'}, got ${why ?? 'allow'}`
+                );
+            }
+        }
+    } finally {
+        for (const [key, value] of Object.entries(savedHome)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+    const total = cases.length + byRule.length;
     console.log(
         bad === 0
-            ? `self-test ok (${cases.length} fence assertions)`
-            : `self-test FAILED (${bad} of ${cases.length})`
+            ? `self-test ok (${total} fence assertions)`
+            : `self-test FAILED (${bad} of ${total})`
     );
     return bad === 0 ? 0 : 1;
 }
@@ -1284,19 +1644,16 @@ function render(items, opts, result, extras) {
     console.log(`\nfenced (${by('never').length}) - considered and refused`);
     for (const i of by('never')) console.log(`  ${i.id.padEnd(34)} ${i.why}`);
 
-    if (extras.listeners.length) {
-        console.log('\nlisteners (this skill never kills anything)');
-        for (const l of extras.listeners) {
-            console.log(`  :${l.Port} ${l.Proc ?? '?'} pid ${l.Pid}`);
-        }
-        console.log(
-            '  owner: node .claude/skills/floe-run/scripts/floe-run.mjs stop'
-        );
+    for (const l of listenerNote(extras.listeners, extras.floeRunPidfile)) {
+        console.log(l);
     }
     if (extras.externals.length) {
         console.log('\nnot swept, reported only');
         for (const n of extras.externals) {
             console.log(`  ${n.what.padEnd(22)} ${n.detail}`);
+            for (const entry of n.list ?? []) {
+                console.log(`  ${' '.repeat(22)} ${entry}`);
+            }
         }
     }
     if (opts.firewall) {
@@ -1328,7 +1685,8 @@ function main() {
         console.log(
             'usage: deep-clean.mjs [survey|sweep] [--apply] [--root dir]\n' +
                 '       [--age-minutes n] [--scratch-days n] [--include id]\n' +
-                '       [--keep path] [--firewall] [--verbose] [--json] [--self-test]'
+                '       [--keep path] [--firewall] [--verbose] [--temp-root dir]\n' +
+                '       [--json] [--self-test]'
         );
         return 0;
     }
@@ -1407,6 +1765,8 @@ function main() {
 
     const extras = {
         listeners: listeners(),
+        // Where floe-run keeps it; the same file the survey fences.
+        floeRunPidfile: exists(path.join(opts.tempRoot, 'floe-run.json')),
         externals: externals(opts.root),
         firewall: opts.firewall ? firewallReport() : [],
     };

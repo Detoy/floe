@@ -56,24 +56,70 @@ a peer.
   instance mutex would forward our launch into the user's window; the driver
   refuses instead. `--desktop none` drops the desktop cells and this check
   with them.
-- Declare presence, and run desktop cells on a built exe only while away.
-  Reading the window never takes the foreground (UI Automation snapshots and
-  text reads, `PrintWindow` captures on the window rect), but any UI
-  Automation pattern call on a built exe (Invoke, SetValue, Toggle)
-  activates its window (G2-F1). That is every click and every field the
-  driver sets, on the Store build, a portable and a head `wails build`
-  alike, so a desktop cell on an exe is away-only: pass `--user-away`, and
-  each pattern call then re-reads `GetLastInputInfo` first and stops the leg
-  as SKIP `present` below 120 s of idle input. The driver enforces that for
-  request hosts only (SKIP `request-host-away-only` without the flag).
-  Nothing else is gated: without `--user-away`, a `probe` or a `run` on an
-  exe lane launches the app and sends SetValue and Invoke at once, and takes
-  the foreground from whoever is at the PC. `--desktop auto` is the default
-  and resolves to the Store app when it is installed (a portable or head exe
-  otherwise), so the default is such a lane. With the owner at the PC the
-  only safe value is `--desktop none`. The `wailsdev`
-  lane drives a headless page and activates nothing. `--pause-max` is parsed
+- Declare presence. Reading the window never takes the foreground (UI
+  Automation snapshots and text reads, `PrintWindow` captures on the window
+  rect), but any UI Automation pattern call on a built exe (Invoke,
+  SetValue, Toggle) activates its window (G2-F1). That is every click and
+  every field the driver sets, on the Store build, a portable and a head
+  `wails build` alike. So on an exe lane (`--desktop store`, `portable`, or
+  `auto`, which is the default and resolves to one of them) `run` and
+  `probe` launch and drive nothing on the desktop unless told to: the
+  probe's desktop half is recorded as skipped, every cell with a desktop
+  side is SKIP `present` in the plan before any launch, request hosts
+  included, and the second line of output says so
+  (`desktop: not launched or driven`). Two flags change that, and nothing
+  else ever implies either.
+  `--user-away` says nobody is at the PC: each pattern call then re-reads
+  `GetLastInputInfo` first and stops the leg as SKIP `present` below 120 s
+  of idle input, and the same read comes once before the launch, before the
+  owner's `desktop.json` is edited, so a run that starts while someone is
+  typing launches and changes nothing. `--allow-foreground` accepts the focus change: desktop
+  cells run with no idle check, as they did by default before the flag
+  existed, and what was away-only then still is (request hosts, SKIP
+  `request-host-away-only`; staging files into a running Store app; the
+  direct start of the Store exe with files). Both together behave as
+  `--user-away`. The `wailsdev` lane drives a headless page, activates
+  nothing and needs neither flag, and `--desktop none` has no desktop to
+  drive. What only reads is not gated: `versions`, the `Get-AppxPackage`
+  lookup that resolves `auto`, the firewall read. `--pause-max` is parsed
   and handed to the legs, and nothing waits on it.
+- `--no-idle-check` goes only with `--user-away` and turns its idle read
+  off, before the launch and before every call. The app is then driven
+  while someone uses the PC: its window takes the foreground on each call,
+  and keys typed at that moment can land in it (the first trap below). It
+  exists for one case: the owner has said, in the same session, that the
+  desktop may be driven while they work. Never pass it on your own judgment,
+  on an idle reading, or because a note or an earlier session says the owner
+  once agreed. The second line of output and the Safety row `input idle
+  check before desktop calls` say that it is off.
+- Putting the app back is never refused. From the moment a leg stops, its
+  steps (Cancel, Close link, the Save to folder) wait only for a 3 s pause
+  in input, inside 40 s for the whole release, where every other step wants
+  120 s of idle. Past the 40 s a step is not sent: the cell names it as
+  `host-release` with what to set by hand, and no later cell of the run
+  launches anything on an exe lane (SKIP `desktop-not-released`). Each
+  release call reads that pause again right before it is sent and gives the
+  helper one second to find its element, so the call lands next to the pause
+  that allowed it; a missing element is tried once more, after another read.
+  The last thing a Store leg does before it closes the app is read the Save
+  to field once more: a value that moved after it was put back is reported.
+- State that outlives one command is checked by the next. A `run` or `probe`
+  on an exe lane exits 3, before it creates or launches anything, when a
+  manifest under `--out` says `desktop.json` was edited and does not say it
+  was put back (a command that was killed after the edit); the line names
+  the `cleanup --run <id>` to run first, and `cleanup` records its restore
+  in that manifest. The desktop probes keep the same record, in
+  `<out>/probe/manifest.json`: a probe that was killed is cleared with
+  `cleanup --run probe`, which replays the backup and deletes nothing (a
+  bare `cleanup` still means the newest run). And `<out>/owner-state.json` keeps the owner's own
+  folders as the Store lane first read them (the Make link form's Save to,
+  and the code Receive folder), so a later command that finds an earlier
+  run's folder in one of those fields puts the owner's value back, not the
+  app's default. It holds two folder paths and nothing else. Do not delete
+  it between the commands of one session; `cleanup` keeps it.
+- The gate is in the launcher as well as in the plan: a desktop leg on an
+  exe refuses to launch when the run carried neither flag, whatever built
+  the leg.
 - The relay byte rule: direct cells move 12 MiB (64 MiB with a desktop
   side), relay cells 4 MiB each (32 MiB per default run, eight relay cells,
   with a CLI that lists `--relay-only`, as every release since v1.10.6
@@ -97,7 +143,7 @@ a peer.
 ## 1. Probe (first run on a machine, and after any desktop or Windows update)
 
 ```text
-node .claude/skills/transfer-audit/scripts/audit.mjs probe --desktop none --out <dir>
+node .claude/skills/transfer-audit/scripts/audit.mjs probe --out <dir>
 node .claude/skills/transfer-audit/scripts/audit.mjs probe --desktop store --user-away --out <dir>
 ```
 
@@ -114,11 +160,17 @@ because the desktop half is one lane's answer and a wailsdev run that read a
 Store probe was gated by the Store app. So switching lanes probes again, and
 a desktop probe on an exe lane is an away cycle of its own. A head run also
 re-probes local TURN once its stack is up, since a probe taken before
-`floe-run` started says nothing about it. With the owner at the PC use the
-first form: the default `auto` resolves to the Store app, and the desktop
-half launches it and drives it before any away check applies, so an
-exe-lane probe is itself an away-only step. The desktop half opens the Floe
-window (main session only, never a subagent):
+`floe-run` started says nothing about it.
+
+The first form, with someone at the PC, runs every probe but the desktop
+ones: on an exe lane (the default `auto` is one) the desktop half is not
+started without `--user-away` or `--allow-foreground` (section 0). The
+second line of output says so, the probe line reads
+`probe P1/P2/P6/P8/P9 desktop: skipped (present)`, and `probe.json` carries
+`desktop.skipped: "present"` with the lane `auto` resolved to, and P1, P2,
+P6, P8 and P9 unknown rather than failed. A run that may drive the desktop
+does not reuse such a file; it probes again. The second form is the desktop
+half, which opens the Floe window (main session only, never a subagent):
 
 - P1, does `ValuePattern.SetValue` on the code field drive React? The helper
   sets `zzz-zzz-zzz`, flips the Send and Receive tabs, reads the value back,
@@ -205,21 +257,22 @@ Two oracles are main-session steps, passed in as flags:
 
 ```text
 node .claude/skills/transfer-audit/scripts/audit.mjs run --profile shipped --quick --out <dir>
+node .claude/skills/transfer-audit/scripts/audit.mjs run --profile shipped --quick --user-away --out <dir>
 node .claude/skills/transfer-audit/scripts/audit.mjs run --profile shipped --out <dir>
 node .claude/skills/transfer-audit/scripts/audit.mjs run --profile shipped --deep --out <dir>
 node .claude/skills/transfer-audit/scripts/audit.mjs run --profile head --quick --desktop none --relaxed --out <dir>
 ```
 
-Every form above but the last drives the desktop app. `--desktop auto` is
-the default and resolves to the Store app when it is installed and on the
-latest tag (a portable exe otherwise), and a run launches it and clicks in
-it with no away check unless `--user-away` is passed. With the owner at the
-PC the only safe value is `--desktop none`: add it to any of them, and run
-the desktop cells with `--user-away` when nobody is there.
+With someone at the PC the first form is the whole run: on the default
+`--desktop auto` (or `store`, or `portable`) it runs the web and CLI cells,
+plans every cell with a desktop side as SKIP `present` without launching the
+app, and exits 5. The second form adds the desktop cells when nobody is
+there. `--allow-foreground` in its place runs them with the owner present,
+who then loses the foreground to the Floe window on every click (section 0).
 
 Run it with `run_in_background`; it prints `PROGRESS <cellId> <verdict>` as
 cells finish and the headline at the end. Expected wall clock on this
-machine (measured 2026-08-29, all green): shipped quick about 1 minute,
+machine (measured 2026-08-29, all green, desktop cells included): shipped quick about 1 minute,
 default (18 rows) about 3, deep (35 rows) about 9 including the 3 GiB cap
 cell, the 500 MiB throughput cell and both 200 MiB kill cells; head quick
 with `--desktop none` takes about a minute. The deep figure was written
@@ -237,7 +290,9 @@ wailsdev` (the real app with real Go bindings served at
 `http://localhost:34115` to a Playwright page) or a `wails build` exe.
 Subsets: `--quick` (6 cells), default (18 rows: 16 executable on either
 profile, because the CLI's `--relay-only` lifts S-REL-C2C's NA; 15 with a
-CLI older than v1.10.6, which has no such flag), `--deep`
+CLI older than v1.10.6, which has no such flag; 8 of them have a desktop
+side and are SKIP `present` on an exe lane without `--user-away` or
+`--allow-foreground`), `--deep`
 (17 more, 35 rows). `--cells S-REL-*,S-DIR-C2D` narrows; a pattern that names no
 executable cell (or only NA rows, or a deep id without `--deep`) is a usage
 error before anything is created. `--desktop
@@ -286,7 +341,16 @@ host its parent, so it holds no foreground rights even while the
 operator's terminal is the foreground window, and its first window shows
 `SW_SHOWNOACTIVATE` (FU-26: a launch from the foreground terminal took the
 foreground twice on 2026-09-30). The cost is the app's stdout and stderr;
-`desktop.launch.txt` records the pid instead. A leg never starts a second
+`desktop.launch.txt` records the pid instead. One start is the exception
+(F1, field run of 2026-10-11): `Win32_Process.Create` answers 2, access
+denied, for the Store package's exe when it carries files, which is how a
+Store sender cell stages them. Then, and only under `--user-away`, the
+driver spawns that exe itself (`launchDirect` in
+`scripts/lib/detached.mjs`: detached, no console, no pipes);
+`desktop.launch.txt` reads `direct launch (F1)` and the leg's evidence
+carries `launch.started: "direct"`. Without `--user-away` nothing is
+started and the cell is SKIP `present`, because a direct child of this
+process can take the foreground. A leg never starts a second
 instance: while any `floe-desktop.exe` or `floe-desktop-dev.exe` (the app
 `wails dev` runs) is up, the cell is SKIP `desktop-running` before
 anything starts, because the single-instance lock forwards a second
@@ -327,13 +391,22 @@ reported as `mtime changed`, never a failure; the run manifest carries it,
 so `cleanup` puts it back too); the portable and head exes
 launch with `APPDATA` redirected; the per-user Explorer entry
 `HKCU\Software\Classes\*\shell\Floe`, which an unpackaged exe points at
-itself on startup, is snapshotted at the first such launch in the process
-(an absent key is left alone and never created), put back by every stop and
-re-read (a mismatch there is a SafetyError, exit 4 in a run; `probe` only
-notes it), and put back once more, best effort, by the exit hook; files for
+itself on startup and creates when there is none (the frontend turns the
+entry on at first run, and a redirected `APPDATA` is always a first run), is
+read once, at the first such launch in the process. An entry that was there
+is put back by every stop and re-read. When there was none, a key that is
+there at stop is removed, but only if its command is exactly the one the app
+writes for an exe this run launched and the key holds nothing else; a key
+for any other exe, or one with values of the owner's own, is left as it is
+and noted. A restore or a removal that the re-read contradicts is a
+SafetyError (exit 4 in a run; `probe` only notes it), and both are tried
+once more, best effort, by the exit hook; files for
 a send are staged on the first launch through argv (a second launch activates the window); the remembered
 save dir is read before the first edit and set back after every receiver
-cell; desktop direct cells move 64 MiB so the pill shows the route for more
+cell, and on the Store build the Make link form's Save to folder is put back
+the same way when a request cell releases its host (`request.saveTo` in
+`attempt.json`; a field that will not take its old value turns a passing
+cell into ERROR `host-release`); desktop direct cells move 64 MiB so the pill shows the route for more
 than one 100 ms sample (a 12 MiB loopback transfer ends 0.4 s after
 connect); the completion and status texts are read as joined text runs,
 because React renders `Sent 1 item` and `Saved to <dir>` as adjacent text
@@ -375,10 +448,13 @@ counts as PASS. SKIP names a machine or run precondition (`uia-setvalue`,
 `browser-relay-na`, `wsl-stopped`, `wsl-sideload`, `harness-build`,
 `head-only`, `disk-space`, `infra-down`, `budget-exhausted`,
 `server-no-request-1`, `request-host-away-only`, `request-no-auto-switch`,
-`request-auto-wailsdev-only`, `request-daily-limit`, `caddy-not-enabled`,
+`request-accept-undrivable`, `request-daily-limit`, `caddy-not-enabled`,
 `docker-absent`, `desktop-running`; `filtered` marks cells dropped by
 `--cells` and is never counted). `head-only` is a head cell named in a
-shipped run. Each has its line in `SKIP_REASONS` in
+shipped run. `present` is the plan's answer for every cell with a desktop
+side on an exe lane run with neither `--user-away` nor `--allow-foreground`
+(section 0), and a leg's own answer when the owner comes back mid-cell
+under `--user-away`. Each has its line in `SKIP_REASONS` in
 `scripts/lib/matrix.mjs`, and a SKIP row names a triage key only for
 `uia-setvalue`: for every other one the reason is the whole account. NA is
 impossible with the product under test
@@ -398,6 +474,19 @@ answer would SKIP every browser relay cell for the day `probe.json` is
 reused). It is not floe.one being down, and the audit cannot tell from where
 it runs whether other visitors are affected. Wait, then run again. A `deny`
 or a bare 403 is not this SKIP: the leg goes on and fails.
+
+`desktop-not-released` is the run stopping itself. An earlier cell could not
+put the desktop app back as it found it (its `host-release` note says what:
+a link still open, the Save to folder not restored), so every later cell
+with an exe on one side is SKIP with this reason instead of building on the
+leftover. Set the named thing right by hand, then run the remaining cells.
+That latch lives in one command. The next command of the same `--out` is
+allowed to launch, reads the field, knows an audit's own folder when it sees
+one (`.../cells/<id>/attempt-<n>/...`, or the P9 probe's `p9-save-dir`), and
+sets the owner's folder from `owner-state.json` at its own release:
+`request.saveTo` then carries `leftover` and `recalled: true`, and the note
+says which folder went back. With nothing kept for that field it sets the
+app's default and says that instead.
 
 What each side says about its own per-file SHA-256 check is carried as
 evidence and never judged: the CLI's `Verified   SHA-256 matched` row and
@@ -419,7 +508,9 @@ precondition or infra abort; 4 a safety invariant tripped (a stats attempt
 on an opted-out receiver, a `desktop.json` restore mismatch); 5 partial
 (SKIP, FLAKY or ERROR present, no FAIL); 6 version drift only; 130
 interrupted. Precedence 2, 4, 3, 130, 1, 5, 6, 0. `versions` exits 0 or 6,
-`probe` 0 or 3, `cleanup` 0 or 1.
+`probe` 0 or 3, `cleanup` 0 or 1. A 3 from `run` or `probe` with the line
+`an earlier run under --out (...) edited the real desktop.json` is the start
+check of section 0: nothing was created, and `cleanup --run <id>` clears it.
 
 The Safety section is printed every run and must read: browser stats
 attempts 0 (all aborted), `floe:bytes-reported` events 0, CLI receivers
@@ -430,9 +521,59 @@ come back, `restored byte-identical: NO` on a mismatch, `not edited (no
 Store-mode leg)` when only portable, head or wailsdev ran), local `/api/stats` 0/0 on the head
 profile, TURN bodies never, `server/.env` never read, captures N (desktop
 PrintWindow captures; browser page screenshots are not counted) all
-window-cropped, forced foreground 0, killed pids own only, working tree
-unchanged, and firewall Block rules on the exes under test `none (N exe(s)
-read)`.
+window-cropped, `desktop app put back as found` `yes (k of k launched
+app(s) closed by themselves, ...)` or `n/a (no built app was launched)`,
+killed pids own only,
+working tree unchanged, and firewall Block rules on the exes under test
+`none (N exe(s) read)`.
+
+Two desktop rows are facts, not a pass mark. `window activations (UIA
+pattern calls on a built app)` is the driver's count of the Invoke, SetValue
+and Toggle calls it sent to an exe, each of which brings the app's window to
+the foreground: 0 on a run that drove no built app, and never 0 on one that
+did (the row used to read `forced foreground: 0 times` on every run, from a
+counter nothing wrote). `input idle check before desktop calls` reads `on`,
+or `OFF` under `--no-idle-check`. And `desktop app put back as found`
+answers only for what was measured. It reads `n/a` when the run launched no
+built app, `yes (k of k ...)` when every app it started was closed by its
+own stop with nothing left over, and `NO:` with the cell and what was left
+whatever that cell's verdict was: a host release that could not finish (an
+open link, the Save to folder), a close that needed taskkill, a code Receive
+folder not put back, a Save to field that moved between its restore and the
+close, a launch that never showed a window (whether its process was ended
+with taskkill or left running), or a launch whose stop had not finished when
+the report was written.
+It used to read `yes` on a run that had measured nothing.
+
+A launch that never shows a window is ended at its stop only when the leg
+can show the process is its own: the pid the launch call returned, or, for
+a Store start through the shell, a `floe-desktop.exe` created while that
+call ran or within 15 s of it. Anything else (a Floe the owner opened
+meanwhile, a `wails dev` app, a process whose creation time cannot be read)
+is left running and named in an `unfound app:` note, and the next cell with
+an exe side reads SKIP `desktop-running`. When the launch returned no pid,
+the stop looks for its process for six seconds before it concludes there is
+none: the shell call returns before the app's process exists.
+
+The Explorer verb (`HKCU\Software\Classes\*\shell\Floe`) is guarded on the
+Store lane as well as on the portable and head ones. A packaged launch does
+not touch the key, and the leg's note then reads `explorer verb: unchanged`
+or `still absent`. A Store exe started directly is the one launch whose
+package identity no run had shown; a Floe without identity registers the
+verb for itself at startup, and the stop then puts the key back as it was
+(`removed ...` when there was none, `put back command ...` when there was).
+
+What an exe run changes on the owner's profile and does not put back,
+because nothing reads it afterwards: the tab the app opens on next time
+(`floe:mode`, set by each RECEIVE click), the remembered "a link is open"
+marker when the app was killed with one open (`floe:requestLinkOpenUntil`,
+so the next launch opens on Request link), and one History row per finished
+drop, the Auto-accept cells' included. A Save to or save folder that an
+earlier audit left on its own run folder is recognized at the next launch
+by its shape (`cells/<id>/attempt-<n>`), cleared to the app's default and
+reported; the owner's earlier choice of folder is not recoverable from the
+app, and the log of the run that lost it has the line `Save to field read
+"<folder>" before this cell`.
 
 One Safety row is a count with no required value: `Sentry envelopes
 (browser, answered locally)`. An audit page is not a visit, so every browser
@@ -521,7 +662,10 @@ best-effort on Ctrl+C.
 
 A hard kill (the node process ended before its `exit` hook ran) can still
 leave `HKCU\Software\Classes\*\shell\Floe` pointing at a deleted scratch
-exe, and `cleanup` does not replay it. The `wailsdev` lane is not covered
+exe, and `cleanup` does not replay it. When there was no entry before that
+run, the key is one the run created, and no later run takes it for its own
+(it names an exe that later run never launched), so the owner removes it
+once: `reg delete "HKCU\Software\Classes\*\shell\Floe" /f`. The `wailsdev` lane is not covered
 either, and there the key has two writers. The operator's own `wails dev`
 app runs the same startup rewrite before the driver could take a snapshot.
 And the audit's own page can write it: the frontend turns the Explorer
@@ -552,7 +696,11 @@ back what the Make link form remembers in the app's own localStorage
 `floe:requestLinkOpenUntil`). That only outlives a run on the Store build,
 whose profile is the owner's: a portable or head exe keeps it under the
 redirected `APPDATA`, and the `wailsdev` page is a fresh browser context
-that takes its storage with it. No run saves into the owner's `Downloads`
+that takes its storage with it. On the Store build a request cell that ends
+on its own puts the Save to folder back itself (section 3), so what is left
+for the owner is the crash case: the field then still names a run folder,
+and the run's `log.txt` has the line that says what it read before the
+cell. No run saves into the owner's `Downloads`
 folder: Make link is never clicked without the attempt's own folder in the
 Save to field (ERROR `request-savedir` otherwise).
 
@@ -678,14 +826,22 @@ included.
   fixed copy; the prompt's size as the view renders it, compared with
   `desktopFmtBytes` of the fixture; the drop folder by the name the Done
   view shows under the run's own save folder) and drive it with Invoke,
-  SetValue and the new `toggle` command. UIA pattern calls activate the
+  SetValue and the `toggle` command. UIA pattern calls activate the
   exe's window (G2-F1), so an exe host is away-only: without `--user-away`
-  its cells SKIP `request-host-away-only`, and with it every pattern call
-  first re-reads `GetLastInputInfo` and stops as SKIP `present` below
-  120 s of idle input. The Invoke that activates the window can be
-  swallowed by the prompt's guard, which re-arms on focus, so Accept and
-  Decline are repeated (three Invokes at most), never sooner than 1.2 s
-  after the prompt was first seen or after the previous Invoke. An exe has
+  its cells SKIP `present` (`request-host-away-only` when the run passed
+  only `--allow-foreground`), and with it every pattern call first re-reads
+  `GetLastInputInfo` and stops as SKIP `present` below 120 s of idle input.
+  Accept and Decline are never invoked on an exe. The prompt ignores input
+  for 1 s after every focus change, an Invoke is a focus change, and on the
+  Store build no Invoke landed (field run of 2026-10-11: the button read
+  disabled within 100 ms of each one, and the third threw
+  `ElementNotEnabledException`). A prompted cell on an exe host therefore
+  proves the link and the prompt, whose file count, size and folder go on
+  record, and stops as SKIP `request-accept-undrivable` with nothing
+  invoked and its link closed. Accept and Decline themselves are proven on
+  the wailsdev lane, and a delivery on an exe by the Auto-accept cells
+  below. Keep waiting is still invoked, 1.2 s after it shows: its guard has
+  no focus term. An exe has
   no bound GetSettings or SetSettings: a proxy's server address rides the
   desktop.json it launches with (`serverOverride`). Since H7 (D-160) there
   is no Beta switch and no `requestLinks` key to seed (a legacy one in a
@@ -709,11 +865,11 @@ included.
   at all) and a local `/api/stats` delta of 0. A CLI that fails is judged
   after the host's own end, so a host stop code stays the finding. No
   used-up check: that needs a second visitor, and the web cells prove it.
-  The released CLI has listed `--to` since v1.11.0, and preflight records
-  that as `cliHasTo`, but nothing plans a shipped twin from it yet:
-  `REQUEST_IDS` has no `S-DIR-C2D-req`, so the cell stays head only until
-  the driver (`scripts/lib/matrix.mjs`, with `references/matrix.md`) adds
-  one.
+  The released CLI has listed `--to` since v1.11.0 (preflight records that
+  as `cliHasTo`), and it is the visitor of `S-DIR-C2D-reqauto` below.
+  `REQUEST_IDS` has no `S-DIR-C2D-req` on purpose: on a built exe a
+  prompted cell stops at the prompt, which `S-DIR-W2D-req` already proves,
+  and it would spend one of the day's 20 links to do so.
 - Before the run: the operator's `wails dev` app must already read
   `reportStats:false`, `migrated:true` and the local server
   (`GetSettings`), as for any wailsdev receiver; otherwise the cell is
@@ -728,9 +884,11 @@ included.
   hidden "Choose files" input, Send is clicked by its label, and the
   page's own status card is read. Relay cells move 4 MiB; TA-11 forces the
   visitor's relay with the audit init script, TA-12 the host's Hide my IP.
-- Accept and Decline wait at least 1.2 s from the moment the prompt was
-  first seen (the frontend's guard is 1 s). Every prompt must carry the
-  visitor's own file count and bytes and no relay-over-cap line.
+- On the wailsdev lane Accept and Decline wait at least 1.2 s from the
+  moment the prompt was first seen (the frontend's guard is 1 s); on an exe
+  they are not invoked at all. Every prompt must carry the visitor's own
+  file count and bytes (on an exe, the size as the view renders it) and no
+  relay-over-cap line.
 - Oracles: the route pair (the visitor's nominated candidate pair, the
   host pill or the lane's route); the host's stats proof and 0 report
   attempts on every visitor (a `floe:bytes-reported` event on a visitor
@@ -777,18 +935,33 @@ included.
 - TA-15 declines the first visitor, reads its declined copy, checks
   nothing was saved, clicks Keep waiting (`request-reopen`) and lets a
   second visitor context deliver.
-- TA-10a (`H-DIR-W2D-reqauto`, head profile, wailsdev host only) makes
-  its link with the Make link form's Auto-accept check on (D-173, D-174),
-  turned on through its label, Auto-accept. It requires the header
-  chip to read AUTO-ACCEPT while the link waits (its sampler keeps that
-  word as idle, never as a route), the drop to start with no prompt at any
-  point and nothing clicked on the host, and the host's link and result
-  marked automatic in `GetRequestLink`; every other TA-10 oracle applies.
-  A build without the switch SKIPs `request-no-auto-switch`, and an exe
-  host SKIPs `request-auto-wailsdev-only` (the UIA lane has no snapshot to
-  read the marks from). Every other cell leaves the switch off, Make link
-  fails `request-flow` when the host holds the other choice, and a
-  prompted drop marked automatic is a FAIL.
+- TA-10a (`reqauto`: `H-DIR-W2D-reqauto`, and the shipped twins
+  `S-DIR-W2D-reqauto` with a web visitor and `S-DIR-C2D-reqauto` with the
+  released CLI as the visitor) makes its link with the Make link form's
+  Auto-accept check on (D-173, D-174). It requires the header chip to read
+  AUTO-ACCEPT while the link waits (its sampler keeps that word as idle,
+  never as a route) and the drop to start with no prompt at any point and
+  nothing clicked on the host; every other TA-10 oracle applies (the CLI
+  twin takes TA-16's, without a used-up check). These are the one delivery a
+  built exe can prove, since nothing has to press Accept. On the wailsdev
+  lane the check is turned on through its label and the host's link and
+  result must be marked automatic in `GetRequestLink`. An exe has no such
+  record to read, so there the check is set through TogglePattern and read
+  back, the link block must end in `Accepts automatically` (FAIL
+  `request-flow` otherwise), and the result's mark goes on record as
+  unknown (`result.autoAccepted: null`, `auto.proof: "link-block"`): a
+  build that forgot the mark passes on an exe and fails on the dev page.
+  The app still asks on an automatic link when a drop is unusual
+  (`desktop/requestauto.go`): a prompt warning, free space it could not
+  read, a volume without the downloaded-file mark (FAT, exFAT, many network
+  shares), or a drop that would leave under 20 GiB or a tenth of the drive
+  free. So `--out` belongs on an NTFS drive with room. A link that reads
+  `Asks first, low space on <drive>` is FAIL `request-flow` by name before
+  anything is sent, and any other prompt is FAIL `request-flow`
+  (`the host went deciding`), with nothing answered. A build without the
+  check SKIPs `request-no-auto-switch`. Every other cell leaves the check
+  off, Make link fails `request-flow` when the host holds the other choice,
+  and a prompted drop marked automatic is a FAIL.
 - TA-17 (`-reqopen`) is the six quick cells with a link open on the
   desktop: the host makes a link into its own `host-drops` folder after
   setup, the quick cell runs as always, and verify requires the same link
@@ -823,19 +996,89 @@ included.
   relayed drop over the cap before it sends any metadata, so no prompt
   reaches the host. TA-12 proves the host-forced relay path only.
 
-Not covered by any cell, so a green request run says nothing about them:
+Owner-away order for a built app. One command per idle window (see Traps),
+in this order, each prefixed with
+`node .claude/skills/transfer-audit/scripts/audit.mjs` and given the same
+`--out <dir>`. Every line carries `--user-away`: without it nothing here
+launches the app at all. Steps 3 to 5 spend one of the day's 20 links each.
+When the owner has said in the session that the app may be driven while they
+use the PC, add `--no-idle-check` to every line (section 0); the order and
+what each step proves are the same, and the idle windows no longer matter.
+
+1. `probe --profile shipped --desktop store --user-away --monitor secondary`
+2. `run --profile shipped --desktop store --user-away --monitor secondary --cells S-DIR-D2C`
+   (a Store sender: `desktop.launch.txt` names the direct launch when
+   `Win32_Process.Create` refused the exe with files)
+3. `run --profile shipped --desktop store --user-away --monitor secondary --cells S-DIR-W2D-reqauto`
+   (the delivery: the check toggled on, the chip AUTO-ACCEPT, no prompt, the
+   hashes equal, and `request.saveTo.restored` true)
+4. `run --profile shipped --desktop store --user-away --monitor secondary --cells S-DIR-W2D-req`
+   (expected: SKIP `request-accept-undrivable` with the prompt on record;
+   its `request.saveTo.before` must be the owner's own folder, not step 3's)
+5. `run --profile shipped --desktop store --user-away --monitor secondary --cells S-DIR-C2D-reqauto`
+   (the released CLI as the visitor)
+6. `probe --profile shipped --desktop portable --user-away --monitor secondary`,
+   then `run --profile shipped --desktop portable --user-away --monitor secondary --cells S-DIR-D2C`
+   (the Explorer key: with none before the run, the sender's notes in
+   `attempt.json` read `explorer verb: ... absent before the run` and then
+   `explorer verb: removed ...`)
+
+Not covered by a live cell (decided). A green request run says nothing about
+these, and does not have to: each was weighed on 2026-10-13 and left to the
+tests that already pin it, named here so the claim can be checked. A live
+cell for any of them would spend one of the day's 20 links, or minutes of
+wall clock, on something that has no network in it.
 
 - Link expiry. Every cell makes a 24 hour link and none waits for one to
   end; the five other Link ends choices are only ever a label the Make link
-  verb can pick.
-- Close link as a finding. Teardown closes the cell's own link, but no
-  visitor is opened on a closed link to read `This link has ended`.
+  verb can pick. The clocks are pinned in `desktop/requestlink_test.go`
+  (`TestShortLinkEndsOnItsOwnClock`, `TestNoNewVisitorAfterLinkEnd`) and the
+  server's answers in `server/server.test.js` ("a link closed or expired
+  unused answers link-ended for a day, then host-absent", "a reservation
+  still in its grace answers link-ended once its end has passed").
+- Close link, and what a visitor reads on a link that has ended. The page
+  half is a browser spec that CI runs on three operating systems for every
+  pull request: `client/e2e/request-link.spec.ts`, "request-link: a link
+  closed before anyone used it reads "This link has ended"". Its host closes
+  the link before any visit, and the server answers an expired link and a
+  closed unused one alike, so it is the page for both. The app half, the
+  built app's Close link reaching production, is exercised by the release of
+  every request cell, which clicks Close link and waits for the ended view;
+  `TestCloseRequestLinkSendsCloseAndEnds` in `desktop/requestlink_test.go`
+  pins the frame it sends.
 - Stop. Cancel drop on the host, and a visitor that cancels, are teardown
-  steps only, never an oracle.
-- The receiver's limits (`requestLimits` in `desktop/transfer.go`, and the
-  10,000 files a drop may carry).
-- Decline and Auto-accept on a shipped build: `H-DIR-W2D-reqdecline` and
-  `H-DIR-W2D-reqauto` are head cells, and neither has a shipped twin yet.
+  steps only, never an oracle. Pinned by `TestRunRequestDropCancelSendsStopped`
+  and `TestRunRequestDropStopReportsSavedBytesOnce` in
+  `desktop/transfer_test.go`, by "a reload waits for the Cancel reason to
+  reach the host" in `client/lib/request/visitorBoundaries.test.ts`, and by
+  `TestSendToCtrlCMidFileTakesOneLineBreak` in
+  `cli/cmd/floe/sendto_barline_test.go`.
+- The receiver's limits (`requestLimits` in `desktop/transfer.go`, the
+  10,000 files a drop may carry, the 24 hour drop limit). Pinned in
+  `cli/engine/transfer/limits_test.go`
+  (`TestLimitsFileCountOverMaxRefusesOverApproved`,
+  `TestLimitsBytesReceivedPastApprovedRefusedMidFileNoPart`,
+  `TestLimitsFreeSpaceBelowReserveRefusesBeforeAck`), by
+  `TestMaxDropFilesMatchesTheOtherSurfaces` in
+  `cli/engine/transfer/dropcheck_test.go`, by
+  `TestRunRequestDropTimeLimitAbortsWithCode` in `desktop/transfer_test.go`,
+  and on the page by "request-link: over-approved refusal shows fixed copy
+  and never the reason" in `client/e2e/request-link.spec.ts`.
+- Accept and Decline on a built exe. This one is a rule, not a gap: the
+  audit never synthesizes input (no mouse, no keys), and no UIA Invoke
+  presses those two buttons on a built app, because a guard there re-arms on
+  every focus change. So a prompted request cell on a built app ends SKIP
+  `request-accept-undrivable` once the prompt is on record, both buttons are
+  proven on the wailsdev lane only, and `H-DIR-W2D-reqdecline` has no shipped
+  twin. Delivery on a built app is proven through Auto-accept
+  (`S-DIR-W2D-reqauto`, `S-DIR-C2D-reqauto`).
+- A prompted CLI visitor on a shipped build. There is no `S-DIR-C2D-req`:
+  it would spend one of the day's 20 links to stop at the prompt
+  `S-DIR-W2D-req` already proves. The released CLI delivers through
+  `S-DIR-C2D-reqauto`.
+- The automatic mark on a built exe: the result's `autoAccepted` and
+  History's `Accepted automatically` line. Only the dev page reads the
+  first, and nothing reads the second.
 
 ## 7b. Forced-mismatch cells (hashbad and hashmal: head only, reached through --cells)
 
@@ -890,13 +1133,20 @@ SKIP: it stops the whole run before any cell as a precondition (exit 3).
   `scripts/desktop-uia.ps1`), the leg compares that one reading, and
   nothing reads the field again before Receive or Make link is clicked. A
   value that read back right can therefore still be wrong when it is used.
-  Away-only is the guard; there is no second read yet.
+  Away-only is the guard; there is no second read yet. `--no-idle-check`
+  takes that guard away on purpose: under it a keystroke can spoil a cell,
+  which costs a rerun, and the release still reads the Save to folder back
+  before it reports it restored.
 - **Something on this PC makes an input event about every 219 s, even with
   nobody there.** `--user-away` wants 120 s of idle input before each
   pattern call, so every cycle leaves about 95 s in which the desktop may be
   driven. That is one or two desktop cells per run: name them with `--cells`
   rather than asking for the whole matrix, and expect SKIP `present` on a
-  cell that straddles the event.
+  cell that straddles the event. Such a cell still puts the app back: its
+  release needs only a 3 s pause (section 0). Before that rule a straddled
+  cell left its link open and, on the Store lane, the Save to folder on a
+  run folder. `--no-idle-check` takes the idle read away altogether, and it
+  is the owner's to ask for, never the operator's to choose.
 - **Twenty request links a day.** Each attempt of each request cell spends
   one, and so did every earlier run of the day from this address (section
   7a).
@@ -911,16 +1161,20 @@ SKIP: it stops the whole run before any cell as a precondition (exit 3).
   `--desktop` value and profile, so a lane switch probes again (section 1).
   Keep one `--out` per lane when alternating, or plan for the extra away
   cycle.
-- **Two Store-lane limits are open** (field run of 2026-10-11, not
-  reproduced by any test here, and not handled by this version). The Store
-  exe did not start through `Win32_Process.Create` when it carried files,
-  which is how a Store sender cell stages them, so such a cell stops at
-  launch. And Accept on a built exe did not take the repeated Invoke the
-  request host sends, so a plain `-req` cell on an exe host proves its
-  prompt and then ends as FAIL with the key `unknown` (no triage row), or as
-  a harness ERROR `exception` when the helper throws on the disabled button.
-  The desktop-lane change that follows this one turns that into a SKIP with
-  the prompt on record. Neither is a product finding.
+- **Two Store-lane facts** (field run of 2026-10-11, Store 1.3.0.0), both
+  handled now and neither a product finding. `Win32_Process.Create` refuses
+  the Store exe when it carries files (return value 2), which is how a
+  Store sender cell stages them: under `--user-away` the driver starts that
+  exe itself and says so in `desktop.launch.txt` (section 3). Whether that
+  start stages the files, and whether it takes the foreground, no run has
+  shown yet. And no UIA Invoke presses Accept on a built exe, so a plain
+  `-req` cell there proves its prompt and stops as SKIP
+  `request-accept-undrivable`; a delivery on an exe is the `reqauto` cells'
+  (section 7a).
+- **Nothing on the desktop runs by default.** On an exe lane a run or a
+  probe with neither `--user-away` nor `--allow-foreground` launches nothing
+  and reports every desktop cell as SKIP `present` (section 0). A report
+  with no desktop rows run is that default, not a broken lane.
 
 ## Done means
 

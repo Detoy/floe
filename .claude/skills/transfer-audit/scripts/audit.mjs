@@ -77,8 +77,10 @@ import {
     QUICK_IDS,
     cellPlan,
     countsForExit,
+    foregroundRefused,
     matchCells,
 } from './lib/matrix.mjs';
+import { ownerStateFor } from './lib/ownerstate.mjs';
 import { Ledger } from './lib/pacing.mjs';
 import {
     selectCli,
@@ -938,18 +940,38 @@ async function runProbes({ opts, io, ledger, fence, log, builds, versions }) {
                 log,
             });
             probe.desktop = { ...probe.desktop, ...d.info, mode: d.mode };
-            const r = await desktop.probe({
-                mode: d.mode,
-                portableExe: d.portableExe,
-                binDir: opts.binDir,
-                out: opts.out,
-                build: d.build,
-                userAway: opts.userAway,
-                pauseMaxMin: opts.pauseMaxMin,
-                fence,
-                log,
-            });
-            probe.desktop = { ...probe.desktop, ...r };
+            // Resolving the lane above only reads (the Store package, a
+            // staged zip). Every desktop probe launches the app and drives
+            // it through UIA, which takes the foreground on an exe lane, so
+            // without --user-away or --allow-foreground none of them starts:
+            // the half is recorded as skipped, its facts unknown, not false.
+            if (foregroundRefused(presenceOf(opts, d.mode))) {
+                probe.desktop = {
+                    ...probe.desktop,
+                    present: true,
+                    focusNeeded: true,
+                    skipped: 'present',
+                    detail: `skipped (present): ${DESKTOP_NOT_DRIVEN}`,
+                };
+                log(`probe desktop (${d.mode}): ${probe.desktop.detail}`);
+            } else {
+                const r = await desktop.probe({
+                    mode: d.mode,
+                    portableExe: d.portableExe,
+                    binDir: opts.binDir,
+                    out: opts.out,
+                    // The record a killed probe leaves for the next command.
+                    shared: probeSharedFor(opts),
+                    build: d.build,
+                    userAway: opts.userAway,
+                    allowForeground: Boolean(opts.allowForeground),
+                    noIdleCheck: Boolean(opts.noIdleCheck),
+                    pauseMaxMin: opts.pauseMaxMin,
+                    fence,
+                    log,
+                });
+                probe.desktop = { ...probe.desktop, ...r };
+            }
         } catch (e) {
             probe.desktop = {
                 ...probe.desktop,
@@ -1026,6 +1048,37 @@ export function webHeadRow(h) {
 export function profileLine(opts) {
     const defaulted = opts.profile === 'shipped' && !opts.profileGiven;
     return `profile: ${opts.profile}${defaulted ? ' (default)' : ''}`;
+}
+
+/** The run's own presence flags, in the shape lib/matrix.mjs foregroundRefused reads. */
+const presenceOf = (opts, desktopMode = opts.desktop) => ({
+    desktopMode,
+    userAway: Boolean(opts.userAway),
+    allowForeground: Boolean(opts.allowForeground),
+});
+
+/** Why the probe's desktop half did not run, for probe.json and the probe line. */
+const DESKTOP_NOT_DRIVEN =
+    'the owner may be at the PC and every UIA call on a built app brings its window to the foreground; pass --user-away when nobody is there, or --allow-foreground to accept the focus change';
+
+/**
+ * The second line of run and probe output on an exe lane that will not be
+ * driven, or null: it names both flags, so an operator who expected desktop
+ * cells learns why there are none before anything runs.
+ */
+export function foregroundLine(opts) {
+    if (!foregroundRefused(presenceOf(opts))) return null;
+    return `desktop: not launched or driven. On an exe lane (--desktop ${opts.desktop}) every UIA call brings the Floe window to the foreground, so the desktop probes are skipped and every cell with a desktop side is SKIP present. Pass --user-away when nobody is at the PC (the input idle time is checked before each call), or --allow-foreground to accept the focus change.`;
+}
+
+/**
+ * The line printed when the input idle check is off, or null: said before
+ * anything runs, in the output and in the log, so no transcript of such a
+ * run reads like an ordinary away run.
+ */
+export function idleCheckLine(opts) {
+    if (!opts.noIdleCheck) return null;
+    return 'desktop: the input idle check is OFF (--no-idle-check). The app is launched and driven while someone may be using the PC: its window takes the foreground on every call, and keys typed then can land in it. Only for a session in which the owner said so.';
 }
 
 /**
@@ -1124,6 +1177,21 @@ export function readProbe(outDir, log, opts = {}) {
         if (was.desktop !== opts.desktop || was.profile !== opts.profile) {
             log(
                 `probe.json was taken for --desktop ${was.desktop} --profile ${was.profile}, not --desktop ${opts.desktop} --profile ${opts.profile}; re-probing`
+            );
+            return null;
+        }
+        // A probe taken without --user-away or --allow-foreground skipped
+        // its desktop half, so it knows nothing of this lane. A run that may
+        // drive the desktop probes again; one that may not has no use for
+        // the missing half. The reverse needs no rule here: a full probe is
+        // reused whatever the flags, because the plan gates on the run's own
+        // (lib/matrix.mjs gateCell).
+        if (
+            p.desktop?.skipped === 'present' &&
+            !foregroundRefused(presenceOf(opts))
+        ) {
+            log(
+                'probe.json skipped the desktop probes (taken with neither --user-away nor --allow-foreground); re-probing'
             );
             return null;
         }
@@ -1739,6 +1807,13 @@ export async function runCmd(opts, io = {}) {
                 `--cells ${opts.cells.join(',')} matches no executable ${opts.profile}/${opts.subset} cell id`
             );
     }
+    // An earlier command that left desktop.json edited is put right before
+    // this one creates or launches anything.
+    const unrestored = unrestoredDesktopLine(opts);
+    if (unrestored) {
+        err(`${NAME}: ${unrestored}`);
+        return EXIT.precondition;
+    }
     // The fence comes first: nothing is created, not even --out, until it
     // has vouched for the paths this run will write.
     const fence = fenceFor(opts, io, exec, { allow: [opts.out, opts.binDir] });
@@ -1781,6 +1856,8 @@ export async function runCmd(opts, io = {}) {
         flags: {
             strict: opts.strict,
             userAway: opts.userAway,
+            allowForeground: Boolean(opts.allowForeground),
+            noIdleCheck: Boolean(opts.noIdleCheck),
             pionTrace: opts.pionTrace,
             desktop: opts.desktop,
             pin: opts.pin,
@@ -1795,9 +1872,16 @@ export async function runCmd(opts, io = {}) {
         `run ${runId} started (profile ${opts.profile}, subset ${opts.subset})`
     );
     if (!opts.json) out(profileLine(opts));
+    // Said before anything runs, and kept in log.txt whatever the output mode.
+    const notDriven = foregroundLine(opts) || idleCheckLine(opts);
+    if (notDriven) {
+        log(notDriven);
+        if (!opts.json) out(notDriven);
+    }
     if (opts.dryRun) return dryRun({ opts, io, out, log });
 
     const safety = newSafety();
+    safety.idleCheckOff = Boolean(opts.noIdleCheck);
     const ledger =
         io.ledger ||
         Ledger.open(path.join(opts.out, 'ledger.json'), {
@@ -2223,8 +2307,10 @@ export async function runCmd(opts, io = {}) {
             cells: opts.cells,
             desktopMode: opts.desktop,
             server: serverFor(opts.profile),
-            // An exe request host is away-only (G2-F1, FU-26).
+            // On an exe lane nothing with a desktop side runs without one of
+            // these two, and a request host needs the first (G2-F1, FU-26).
             userAway: Boolean(opts.userAway),
+            allowForeground: Boolean(opts.allowForeground),
             // TA-14 runs only when asked (FU-26).
             caddy: Boolean(opts.caddy),
         });
@@ -2289,6 +2375,8 @@ export async function runCmd(opts, io = {}) {
             pionTrace: opts.pionTrace,
             cliHasRelayOnly: Boolean(builds.cli?.hasRelayOnly),
             userAway: opts.userAway,
+            allowForeground: Boolean(opts.allowForeground),
+            noIdleCheck: Boolean(opts.noIdleCheck),
             pauseMaxMin: opts.pauseMaxMin,
             shared: {
                 fence,
@@ -2300,6 +2388,13 @@ export async function runCmd(opts, io = {}) {
                 // The same object the Safety table reads: every web context
                 // of the run counts the Sentry envelopes it answered here.
                 webGuards: safety.webGuards,
+                // And the driver's count of pattern calls on a built app.
+                desktopCalls: safety.desktopCalls,
+                // And the count of built apps started and put back.
+                desktopLegs: safety.desktopLegs,
+                // The owner's own Save to and save folder, as any command
+                // of this --out read them (lib/ownerstate.mjs).
+                ownerState: ownerStateFor(opts.out),
             },
             onPid: (pid, label) => {
                 if (!pid) return;
@@ -2456,6 +2551,12 @@ export async function probeCmd(opts, io = {}) {
     const out = io.stdout || ((s) => process.stdout.write(s + '\n'));
     const err = io.stderr || ((s) => process.stderr.write(s + '\n'));
     const exec = io.exec || defaultExec;
+    // The desktop probes launch the app behind the same guard a run uses.
+    const unrestored = unrestoredDesktopLine(opts);
+    if (unrestored) {
+        err(`${NAME}: ${unrestored}`);
+        return EXIT.precondition;
+    }
     // Fence first, then the directory and the log it vouched for.
     const fence = fenceFor(opts, io, exec, { allow: [opts.out, opts.binDir] });
     fence.assertWritable(path.join(opts.out, 'probe.json'));
@@ -2468,6 +2569,11 @@ export async function probeCmd(opts, io = {}) {
         io.echoLog ? out : null
     );
     if (!opts.json) out(profileLine(opts));
+    const notDriven = foregroundLine(opts) || idleCheckLine(opts);
+    if (notDriven) {
+        log(notDriven);
+        if (!opts.json) out(notDriven);
+    }
     const ledger =
         io.ledger ||
         Ledger.open(path.join(opts.out, 'ledger.json'), {
@@ -2641,12 +2747,92 @@ export async function versionsCmd(opts, io = {}) {
     return code;
 }
 
+/**
+ * Runs under --out whose manifest says the Store-mode guard edited the real
+ * desktop.json and never says the file was put back: the command was killed
+ * after the edit, or its restore failed. The guard of a new command would
+ * back up that edited file as the owner's and "restore" it at the end,
+ * identical and wrong (second review of #542, finding A), so a desktop run
+ * refuses to start until `cleanup` has replayed the earlier backup.
+ */
+export function unrestoredDesktopRuns(outDir) {
+    if (!outDir || !existsSync(outDir)) return [];
+    const left = [];
+    for (const e of readdirSync(outDir, { withFileTypes: true })) {
+        if (!e.isDirectory()) continue;
+        const file = path.join(outDir, e.name, 'manifest.json');
+        if (!existsSync(file)) continue;
+        let m = null;
+        try {
+            m = JSON.parse(readFileSync(file, 'utf8'));
+        } catch {
+            continue;
+        }
+        const d = m && m.desktop;
+        if (d && d.backup && d.restored !== true)
+            left.push({ runId: e.name, backup: String(d.backup) });
+    }
+    return left.sort((a, b) => a.runId.localeCompare(b.runId));
+}
+
+/** The folder under --out that holds the probes' evidence and their manifest. */
+export const PROBE_RUN = 'probe';
+
+/**
+ * What the desktop probes hand their legs. The probes launch the Store app
+ * behind the same guard a run uses, five times over, and they are the
+ * longest command of a session. A probe killed between an edit of
+ * desktop.json and its restore used to leave nothing the next command's
+ * start check could read, because only a run had a manifest (third review
+ * of #542, finding 1). <out>/probe/manifest.json is that record, in the
+ * shape `cleanup --run probe` replays; it names nothing for cleanup to
+ * delete.
+ */
+export function probeSharedFor(opts) {
+    const dir = path.join(opts.out, PROBE_RUN);
+    const file = path.join(dir, 'manifest.json');
+    const manifest = {
+        runId: PROBE_RUN,
+        kind: 'probe',
+        startedAt: new Date().toISOString(),
+        out: opts.out,
+        runDir: dir,
+        binDir: null,
+        binDirOwned: false,
+        pids: [],
+        desktop: { backup: null, configPath: null, sha256: null, restored: null },
+        stack: { owned: false, started: false },
+        fixtureDirs: [],
+        appDataRedirect: null,
+    };
+    return {
+        manifest,
+        writeManifest: () => {
+            mkdirSync(dir, { recursive: true });
+            writeJson(file, manifest);
+        },
+        ownerState: ownerStateFor(opts.out),
+    };
+}
+
+/** The refusal for unrestoredDesktopRuns, or null when a run may start. */
+export function unrestoredDesktopLine(opts) {
+    if (opts.desktop === 'none' || opts.desktop === 'wailsdev') return null;
+    const left = unrestoredDesktopRuns(opts.out);
+    if (!left.length) return null;
+    const ids = left.map((l) => l.runId).join(', ');
+    return `an earlier run under --out (${ids}) edited the real desktop.json and its manifest does not say the file was put back. Nothing is launched: a new run would take the edited file for the owner's. Run "cleanup --run ${left[0].runId} --out ${opts.out}" first; if it cannot restore the file, restore it by hand from ${left[0].backup} and delete that run's folder.`;
+}
+
 function newestRun(outDir) {
     if (!existsSync(outDir)) return null;
     const dirs = readdirSync(outDir, { withFileTypes: true })
         .filter(
             (e) =>
                 e.isDirectory() &&
+                // The probes' folder has a manifest too; it is not a run, and
+                // its name would sort after every run id.
+                e.name !== PROBE_RUN &&
                 existsSync(path.join(outDir, e.name, 'manifest.json'))
         )
         .map((e) => e.name)
@@ -2750,6 +2936,13 @@ export async function cleanupCmd(opts, io = {}) {
                     `desktop.json: ${r && r.detail ? r.detail : 'restore attempted'}`
                 );
                 if (r && r.ok === false) refused += 1;
+                else if (manifest.desktop.restored !== true && existsSync(file)) {
+                    // On record, so the next run's start check
+                    // (unrestoredDesktopLine) lets it through.
+                    manifest.desktop.restored = true;
+                    manifest.desktop.restoredBy = 'cleanup';
+                    writeJson(file, manifest);
+                }
             } catch (e) {
                 err(`${NAME}: desktop.json restore failed: ${e.message}`);
                 refused += 1;

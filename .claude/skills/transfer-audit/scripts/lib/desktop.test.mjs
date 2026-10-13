@@ -43,6 +43,7 @@ import {
     READY_AFTER_DECISIVE_MS,
     SAMPLE_MS,
     SHELL_MENU_KEY,
+    SHELL_MENU_PS,
     STRINGS,
     ShellMenuGuard,
     USER_AWAY_IDLE_S,
@@ -83,6 +84,7 @@ import {
     writeShellMenu,
     xpathLiteral,
 } from './desktop.mjs';
+import { ownerStateFor } from './ownerstate.mjs';
 
 const tmp = () => mkdtempSync(path.join(tmpdir(), 'desktop-test-'));
 const INTERRUPT_CHILD = fileURLToPath(
@@ -753,7 +755,7 @@ function scriptedDriver(state) {
 }
 
 function legWith(opts, state) {
-    const leg = new DesktopLeg({ evidenceDir: null, ...opts });
+    const leg = new DesktopLeg({ evidenceDir: null, allowForeground: true, ...opts });
     const driver = scriptedDriver(state);
     leg.launch = async () => {
         leg.driver = driver;
@@ -1036,6 +1038,7 @@ test('--user-away stages only after 120 s of input idle; otherwise SKIP present 
 test('wailsdev: a receiver is driven only when GetSettings already shows the audit values', async () => {
     const mk = (settings, role = 'receiver') =>
         new DesktopLeg({
+            allowForeground: true,
             role,
             input: 'code',
             code: 'a-b-c',
@@ -1116,6 +1119,7 @@ test('launch registers the app pid with lib/proc.mjs (spawned and window-found a
             },
         };
         const leg = new DesktopLeg({
+            allowForeground: true,
             role: 'receiver',
             cellId: 'T-PID',
             input: 'code',
@@ -1173,6 +1177,7 @@ test('a sender leg reports that it launched with toasts off, with no stats proof
             },
         };
         const leg = new DesktopLeg({
+            allowForeground: true,
             role: 'sender',
             cellId: 'T-TOAST',
             files: ['C:\\x\\a.bin'],
@@ -1397,19 +1402,27 @@ const INFRA_NOWHERE = { server: 'http://127.0.0.1:9', web: 'http://127.0.0.1:9' 
 /**
  * An in-memory HKCU behind the injected exec. It decodes the request out of
  * the -EncodedCommand script the way PowerShell does and answers in the same
- * base64 JSON, under the script's rules: a write never creates a key, and
- * present means a string Default on the command subkey. brokenWrites answers
- * ok and changes nothing; failReads makes every read exit non-zero.
+ * base64 JSON, under the script's rules: a write never creates a key, present
+ * means a string Default on the command subkey, exists means the base key is
+ * there at all, and a delete removes the key only when its command is one of
+ * the commands the request names (ignoring case) and the key holds nothing
+ * but what the app writes (Default, Icon, the command subkey's Default).
+ * brokenWrites and brokenDeletes answer ok and change nothing; failReads and
+ * failDeletes make that call exit non-zero.
  */
 function fakeRegistry(menu = null) {
     const keys = new Map();
     const reg = {
         keys,
         calls: [],
+        requests: [],
         reads: 0,
         writes: 0,
+        deletes: 0,
         brokenWrites: false,
+        brokenDeletes: false,
         failReads: false,
+        failDeletes: false,
     };
     const put = (m, name, e) => (e ? m.set(name, { ...e }) : m.delete(name));
     reg.set = (values, key = SHELL_MENU_KEY) => {
@@ -1436,6 +1449,7 @@ function fakeRegistry(menu = null) {
         const script = Buffer.from(args[i + 1], 'base64').toString('utf16le');
         const m = /FromBase64String\('([A-Za-z0-9+/=]+)'\)/.exec(script);
         const req = JSON.parse(Buffer.from(m[1], 'base64').toString('utf8'));
+        reg.requests.push(req);
         if (req.op === 'write') {
             reg.writes += 1;
             if (!keys.has(req.key) || !keys.has(`${req.key}\\command`))
@@ -1446,12 +1460,62 @@ function fakeRegistry(menu = null) {
             if (!reg.brokenWrites) reg.set(req.values, req.key);
             return answer({ ok: true });
         }
+        if (req.op === 'delete') {
+            reg.deletes += 1;
+            if (reg.failDeletes) throw new Error('powershell.exe exited 1');
+            // The script opens the parent and deletes the leaf by name.
+            assert.equal(`${req.parent}\\${req.leaf}`, req.key);
+            assert.ok(Array.isArray(req.commands) && req.commands.length > 0);
+            const base = keys.get(req.key);
+            const sub = keys.get(`${req.key}\\command`);
+            if (!base)
+                return answer({
+                    ok: true,
+                    deleted: false,
+                    reason: 'absent',
+                    command: null,
+                });
+            const command = sub && sub.has('') ? sub.get('').value : null;
+            const mine =
+                command !== null &&
+                req.commands.some(
+                    (c) => c.toLowerCase() === command.toLowerCase()
+                );
+            if (!mine)
+                return answer({
+                    ok: true,
+                    deleted: false,
+                    reason: 'foreign',
+                    command,
+                });
+            const extra =
+                [...base.keys()].some((n) => n !== '' && n !== 'Icon') ||
+                [...sub.keys()].some((n) => n !== '') ||
+                [...keys.keys()].some(
+                    (k) =>
+                        k.startsWith(`${req.key}\\`) &&
+                        k !== `${req.key}\\command`
+                );
+            if (extra)
+                return answer({
+                    ok: true,
+                    deleted: false,
+                    reason: 'extra',
+                    command,
+                });
+            if (!reg.brokenDeletes) {
+                keys.delete(`${req.key}\\command`);
+                keys.delete(req.key);
+            }
+            return answer({ ok: true, deleted: true, reason: null, command });
+        }
         reg.reads += 1;
         if (reg.failReads) throw new Error('powershell.exe exited 1');
         // Hashtable order, not the reader's: the reader normalizes it.
         const now = reg.menu(req.key);
         return answer({
             ok: true,
+            exists: keys.has(req.key),
             present: now.command !== null,
             values: { command: now.command, icon: now.icon, name: now.name },
         });
@@ -1495,9 +1559,23 @@ function fakeUiaClient(exe) {
     });
 }
 
-/** An unpackaged leg whose launcher plays the desktop/app.go startup self-heal. */
-function unpackagedLeg(dir, reg, guard, { id, exe, mode = 'portable' }) {
+/**
+ * An unpackaged leg whose launcher plays what the app does to the verb on a
+ * launch: the desktop/app.go startup self-heal (a command that names another
+ * exe is rewritten to this one) and the frontend's first-run default (App.tsx:
+ * with no floe:ctx-menu marker, which a redirected APPDATA never has, and no
+ * entry for this exe, EnableContextMenu registers it, creating the key).
+ * `registeredAs` is the path os.Executable() gave the app when it is not
+ * spelled the way the window search reports it.
+ */
+function unpackagedLeg(
+    dir,
+    reg,
+    guard,
+    { id, exe, mode = 'portable', registeredAs = exe }
+) {
     return new DesktopLeg({
+        allowForeground: true,
         role: 'receiver',
         cellId: id,
         input: 'code',
@@ -1510,8 +1588,9 @@ function unpackagedLeg(dir, reg, guard, { id, exe, mode = 'portable' }) {
         shellMenu: guard,
         launcher: async () => {
             const now = reg.menu();
-            if (now.command && now.command.value !== SELF_HEAL(exe).command.value)
-                reg.set(SELF_HEAL(exe));
+            const mine = SELF_HEAL(registeredAs);
+            if (!now.command || now.command.value !== mine.command.value)
+                reg.set(mine);
             return { child: null, pid: null };
         },
         infra: INFRA_NOWHERE,
@@ -1526,6 +1605,7 @@ test('readShellMenu and writeShellMenu: base64 JSON through -EncodedCommand, byt
     const reg = fakeRegistry();
     const opts = { exec: reg.exec };
     assert.deepEqual(readShellMenu(opts), {
+        exists: false,
         present: false,
         values: { name: null, icon: null, command: null },
     });
@@ -1537,6 +1617,7 @@ test('readShellMenu and writeShellMenu: base64 JSON through -EncodedCommand, byt
     const exe = 'C:\\Users\\Zo\u00eb\\Floe Test\\floe-desktop.exe';
     reg.set({ name: null, icon: null, command: null });
     assert.equal(readShellMenu(opts).present, false, 'empty keys are not present');
+    assert.equal(readShellMenu(opts).exists, true, 'but the base key is there');
     writeShellMenu(SELF_HEAL(exe), opts);
     const back = readShellMenu(opts);
     assert.equal(back.present, true);
@@ -1559,21 +1640,11 @@ test('readShellMenu and writeShellMenu: base64 JSON through -EncodedCommand, byt
     assert.throws(() => readShellMenu({ exec: () => refused }), /access denied/);
 });
 
-test('ShellMenuGuard: an absent key, another platform or a failed read never writes, for the rest of the process', () => {
-    const absent = fakeRegistry();
-    const guard = new ShellMenuGuard({ exec: absent.exec, platform: 'win32' });
-    const notes = [];
-    assert.equal(guard.take((l) => notes.push(l)), 'absent');
-    assert.match(notes[0], /absent; the app never creates it/);
-    absent.set(ORIGINAL_MENU);
-    assert.equal(guard.take(), 'absent', 'one snapshot per process');
-    assert.deepEqual(guard.restore(), { wrote: false, match: null });
-    assert.equal(absent.reads, 1, 'nothing read after the absent snapshot');
-    assert.equal(absent.writes, 0);
-
+test('ShellMenuGuard: another platform, a failed read, or a key that vanishes mid-run never writes, for the rest of the process', () => {
     const other = fakeRegistry(ORIGINAL_MENU);
     const linux = new ShellMenuGuard({ exec: other.exec, platform: 'linux' });
     assert.equal(linux.take(), 'off');
+    linux.own('C:\\scratch\\floe-desktop.exe');
     assert.deepEqual(linux.restore(), { wrote: false, match: null });
     assert.equal(other.calls.length, 0, 'not Windows: no PowerShell at all');
 
@@ -1584,8 +1655,9 @@ test('ShellMenuGuard: an absent key, another platform or a failed read never wri
     assert.equal(unreadable.take((l) => n2.push(l)), 'unreadable');
     assert.match(n2[0], /snapshot read failed/);
     flaky.failReads = false;
+    unreadable.own('C:\\Program Files\\Floe\\floe-desktop.exe');
     assert.deepEqual(unreadable.restore(), { wrote: false, match: null });
-    assert.equal(flaky.writes, 0);
+    assert.equal(flaky.writes + flaky.deletes, 0);
 
     const late = fakeRegistry(ORIGINAL_MENU);
     const armed = new ShellMenuGuard({ exec: late.exec, platform: 'win32' });
@@ -1603,7 +1675,286 @@ test('ShellMenuGuard: an absent key, another platform or a failed read never wri
     late.keys.clear();
     assert.deepEqual(armed.restore(), { wrote: false, match: null });
     assert.equal(late.keys.size, 0, 'a key deleted mid-run is not recreated');
+    assert.equal(late.deletes, 0, 'an armed guard never deletes');
 });
+
+// B1. The comment here used to say the app never creates the key. It does: on
+// a profile with no floe:ctx-menu marker the frontend turns the entry on
+// (desktop/frontend/src/App.tsx, "First run defaults it ON"), and a portable
+// or head launch always runs on such a profile, because its APPDATA is
+// redirected. A key that was absent when the run began is therefore the run's
+// own to remove, provided it still is what the app wrote for an exe this
+// process launched.
+test('ShellMenuGuard, key absent before the run: still absent is left alone; a key for an exe this process launched is removed, and only that one', () => {
+    const exe = 'C:\\scratch\\a\\floe-desktop.exe';
+
+    // Nothing appeared: one more read, no delete.
+    const quiet = fakeRegistry();
+    const g0 = new ShellMenuGuard({ exec: quiet.exec, platform: 'win32' });
+    const n0 = [];
+    assert.equal(
+        g0.take((l) => n0.push(l)),
+        'absent'
+    );
+    assert.match(n0[0], /absent before the run/);
+    g0.own(exe);
+    assert.deepEqual(
+        g0.restore((l) => n0.push(l)),
+        { wrote: false, match: true }
+    );
+    assert.match(n0[1], /still absent/);
+    assert.deepEqual([quiet.reads, quiet.writes, quiet.deletes], [2, 0, 0]);
+
+    // The launch created it: removed, in one call that names the exe.
+    const made = fakeRegistry();
+    const g1 = new ShellMenuGuard({ exec: made.exec, platform: 'win32' });
+    assert.equal(g1.take(), 'absent');
+    made.set(SELF_HEAL(exe));
+    assert.equal(g1.take(), 'absent', 'one snapshot per process');
+    g1.own(exe);
+    const n1 = [];
+    assert.deepEqual(
+        g1.restore((l) => n1.push(l)),
+        { wrote: true, match: true }
+    );
+    assert.equal(made.keys.size, 0, 'the key and its command subkey are gone');
+    assert.match(
+        n1[0],
+        /explorer verb: removed HKCU\\Software\\Classes\\\*\\shell\\Floe, which a launch of this run had created \(command "C:\\scratch\\a\\floe-desktop\.exe" "%1"\)/
+    );
+    const del = made.requests.find((r) => r.op === 'delete');
+    assert.deepEqual(del, {
+        op: 'delete',
+        key: SHELL_MENU_KEY,
+        parent: 'Software\\Classes\\*\\shell',
+        leaf: 'Floe',
+        commands: [`"${exe}" "%1"`],
+    });
+    assert.equal(made.writes, 0, 'a delete, never a write');
+    // And again is nothing: the guard keeps the absence for the next leg.
+    assert.deepEqual(g1.restore(), { wrote: false, match: true });
+    assert.equal(made.deletes, 1);
+
+    // os.Executable() and the window search may spell the path differently:
+    // every exe the process launched is owned, compared without case.
+    const cased = fakeRegistry();
+    const g2 = new ShellMenuGuard({ exec: cased.exec, platform: 'win32' });
+    g2.take();
+    cased.set(SELF_HEAL('C:\\SCRATCH\\A\\Floe-Desktop.exe'));
+    g2.own('C:\\other\\floe-desktop.exe');
+    g2.own(exe);
+    g2.own(exe);
+    g2.own(null);
+    assert.deepEqual(g2.restore(), { wrote: true, match: true });
+    assert.equal(cased.keys.size, 0);
+    assert.equal(
+        cased.requests.find((r) => r.op === 'delete').commands.length,
+        2,
+        'each exe once'
+    );
+});
+
+test("ShellMenuGuard, key absent before the run: a key that is not this run's is left exactly as it is, and a delete that leaves the key behind is a SafetyError", () => {
+    const exe = 'C:\\scratch\\a\\floe-desktop.exe';
+
+    // The owner installed Floe while the run was going: another exe's key.
+    const foreign = fakeRegistry();
+    const g0 = new ShellMenuGuard({ exec: foreign.exec, platform: 'win32' });
+    g0.take();
+    foreign.set(ORIGINAL_MENU);
+    g0.own(exe);
+    const n0 = [];
+    assert.deepEqual(
+        g0.restore((l) => n0.push(l)),
+        { wrote: false, match: null }
+    );
+    assert.deepEqual(foreign.menu(), ORIGINAL_MENU);
+    assert.match(
+        n0[0],
+        /appeared during the run but its command .* is not for an exe this run launched; left alone/
+    );
+
+    // No exe of this process ever got as far as a launch: nothing is asked.
+    const unowned = fakeRegistry();
+    const g1 = new ShellMenuGuard({ exec: unowned.exec, platform: 'win32' });
+    g1.take();
+    unowned.set(SELF_HEAL(exe));
+    assert.deepEqual(g1.restore(), { wrote: false, match: null });
+    assert.equal(unowned.deletes, 0);
+    assert.deepEqual(unowned.menu(), SELF_HEAL(exe));
+
+    // The owner's own additions (a value, a subkey): not what the app wrote.
+    for (const add of [
+        (r) =>
+            r.keys
+                .get(SHELL_MENU_KEY)
+                .set('Position', { kind: 'String', value: 'Top' }),
+        (r) =>
+            r.keys
+                .get(`${SHELL_MENU_KEY}\\command`)
+                .set('DelegateExecute', { kind: 'String', value: '{x}' }),
+        (r) => r.keys.set(`${SHELL_MENU_KEY}\\DropTarget`, new Map()),
+    ]) {
+        const extra = fakeRegistry();
+        const g = new ShellMenuGuard({ exec: extra.exec, platform: 'win32' });
+        g.take();
+        extra.set(SELF_HEAL(exe));
+        add(extra);
+        g.own(exe);
+        const n = [];
+        assert.deepEqual(
+            g.restore((l) => n.push(l)),
+            { wrote: false, match: null }
+        );
+        assert.match(n[0], /holds more than the app writes; left alone/);
+        assert.deepEqual(extra.menu(), SELF_HEAL(exe));
+        assert.ok(extra.keys.size >= 2);
+    }
+
+    // A base key with no command is not absent: nothing of it is ever removed.
+    const bare = fakeRegistry();
+    bare.set({
+        name: { kind: 'String', value: 'Send with Floe' },
+        icon: null,
+        command: null,
+    });
+    const g3 = new ShellMenuGuard({ exec: bare.exec, platform: 'win32' });
+    const n3 = [];
+    assert.equal(
+        g3.take((l) => n3.push(l)),
+        'incomplete'
+    );
+    assert.match(n3[0], /exists without a command; left alone/);
+    bare.set(SELF_HEAL(exe));
+    g3.own(exe);
+    assert.deepEqual(g3.restore(), { wrote: false, match: null });
+    assert.deepEqual([bare.reads, bare.deletes], [1, 0]);
+
+    // The delete answered ok and the key is still there, or the call failed.
+    for (const flag of ['brokenDeletes', 'failDeletes']) {
+        const stuck = fakeRegistry();
+        const g = new ShellMenuGuard({ exec: stuck.exec, platform: 'win32' });
+        g.take();
+        stuck.set(SELF_HEAL(exe));
+        stuck[flag] = true;
+        g.own(exe);
+        const n = [];
+        assert.throws(
+            () => g.restore((l) => n.push(l)),
+            (err) => {
+                assert.ok(err instanceof SafetyError, err.stack);
+                if (flag === 'failDeletes') {
+                    // The call failed before the script could say whose key
+                    // it is: still an alarm, but it claims no ownership and
+                    // hands over no forced delete.
+                    assert.match(
+                        err.message,
+                        /was absent before the run and is there now/
+                    );
+                    assert.match(
+                        err.message,
+                        /the delete call failed before it could tell whether the key is this run's/
+                    );
+                    assert.match(
+                        err.message,
+                        /reg query "HKCU\\Software\\Classes\\\*\\shell\\Floe\\command" \/ve/
+                    );
+                    assert.doesNotMatch(err.message, /reg delete/);
+                    return true;
+                }
+                assert.match(
+                    err.message,
+                    /was absent before the run and is still there after the delete/
+                );
+                assert.match(
+                    err.message,
+                    /reg delete "HKCU\\Software\\Classes\\\*\\shell\\Floe" \/f/
+                );
+                return true;
+            },
+            flag
+        );
+        if (flag === 'failDeletes')
+            assert.match(n[0], /explorer verb: delete failed: /);
+        assert.deepEqual(stuck.menu(), SELF_HEAL(exe));
+    }
+
+    // The re-read failing after a delete is a note; the next restore reads again.
+    const blind = fakeRegistry();
+    const g4 = new ShellMenuGuard({ exec: blind.exec, platform: 'win32' });
+    g4.take();
+    blind.set(SELF_HEAL(exe));
+    g4.own(exe);
+    const realExec = blind.exec;
+    let calls = 0;
+    g4.exec = (cmd, args) => {
+        calls += 1;
+        // take was call 0 on the real exec; here: read, delete, then the re-read.
+        if (calls === 3) throw new Error('powershell.exe exited 1');
+        return realExec(cmd, args);
+    };
+    const n4 = [];
+    assert.deepEqual(
+        g4.restore((l) => n4.push(l)),
+        { wrote: true, match: null }
+    );
+    assert.match(n4[0], /re-read after the delete failed/);
+    assert.equal(blind.keys.size, 0);
+});
+
+// The script itself is never run by a test (it would touch the real HKCU), so
+// what the fake cannot prove is checked on the text: the delete is two
+// non-recursive DeleteSubKey calls on a key opened by name, the ownership
+// compare is ordinal and ignores case, and PowerShell parses the whole script.
+test(
+    'the registry script: delete is non-recursive and compares the command itself, and PowerShell parses it without running it',
+    { skip: process.platform !== 'win32' && 'PowerShell only' },
+    () => {
+        assert.ok(
+            !SHELL_MENU_PS.includes('DeleteSubKeyTree'),
+            'never a recursive delete'
+        );
+        assert.equal(
+            (SHELL_MENU_PS.match(/\.DeleteSubKey\(/g) || []).length,
+            2,
+            'the command subkey, then the key'
+        );
+        assert.match(SHELL_MENU_PS, /OrdinalIgnoreCase/);
+        assert.ok(
+            !SHELL_MENU_PS.includes('`'),
+            'no backtick, which the template literal would end on'
+        );
+        assert.equal(
+            SHELL_MENU_PS.split('@REQUEST@').length,
+            2,
+            'one request slot'
+        );
+        const dir = tmp();
+        try {
+            const file = path.join(dir, 'shell-menu.ps1');
+            writeFileSync(
+                file,
+                SHELL_MENU_PS.replace('@REQUEST@', 'e30='),
+                'utf8'
+            );
+            const r = spawnSync(
+                'powershell.exe',
+                [
+                    '-NoProfile',
+                    '-NonInteractive',
+                    '-Command',
+                    `$t = $null; $e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile('${file.replace(/'/g, "''")}', [ref]$t, [ref]$e); 'errors=' + @($e).Count; @($e) | ForEach-Object { $_.Message }`,
+                ],
+                // Hidden: from a parent with no console this would open one.
+                { encoding: 'utf8', timeout: 60_000, windowsHide: true }
+            );
+            assert.equal(r.status, 0, r.stderr);
+            assert.match(r.stdout, /^errors=0\s*$/, r.stdout);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    }
+);
 
 test('the first unpackaged launch snapshots the Explorer verb and stop() puts a self-heal rewrite back byte-exact, across two overlapping legs', async () => {
     const dir = tmp();
@@ -1704,7 +2055,128 @@ test('a restore the re-read contradicts is a SafetyError thrown after the helper
     }
 });
 
-test('Store and wailsdev legs never touch the Explorer verb', async () => {
+test('B1: with no Explorer verb before the run, the one a portable or head launch registers is removed at stop, whichever spelling of the exe the app wrote, and the next leg starts from absent again', async () => {
+    const dir = tmp();
+    try {
+        const reg = fakeRegistry();
+        const guard = new ShellMenuGuard({ exec: reg.exec, platform: 'win32' });
+        const exeA = 'C:\\scratch\\a\\floe-desktop.exe';
+        const exeB = 'C:\\scratch\\b\\floe-desktop.exe';
+        const a = unpackagedLeg(dir, reg, guard, {
+            id: 'T-MENU-NEW-A',
+            exe: exeA,
+        });
+        await a.launch([]);
+        assert.equal(guard.state, 'absent');
+        assert.ok(a.shellMenuArmed, 'an absent key is guarded too');
+        assert.deepEqual(
+            reg.menu(),
+            SELF_HEAL(exeA),
+            'the first-run default registered it'
+        );
+        assert.ok(
+            a.notes.some((n) =>
+                /explorer verb: HKCU\\.* absent before the run/.test(n)
+            ),
+            a.notes.join('\n')
+        );
+        await a.stop('test');
+        assert.equal(reg.keys.size, 0, 'the key the launch created is gone');
+        assert.ok(
+            a.notes.some((n) =>
+                n.includes('which a launch of this run had created')
+            ),
+            a.notes.join('\n')
+        );
+        assert.equal(reg.writes, 0);
+
+        // A head exe whose own path (os.Executable) is spelled another way
+        // than the build path: the leg owns the planned command and the exe
+        // the window search reports, and the compare ignores case.
+        const b = unpackagedLeg(dir, reg, guard, {
+            id: 'T-MENU-NEW-B',
+            exe: exeB,
+            mode: 'head',
+            registeredAs: 'C:\\SCRATCH\\B\\floe-desktop.exe',
+        });
+        await b.launch([]);
+        assert.equal(
+            guard.state,
+            'absent',
+            'the absence is kept for every later leg'
+        );
+        assert.ok(reg.menu().command, 'registered again');
+        await b.stop('test');
+        assert.equal(reg.keys.size, 0);
+        assert.equal(reg.deletes, 2);
+        assert.ok(!activeLegs.has(a) && !activeLegs.has(b));
+    } finally {
+        dropLegs(/^T-MENU-/);
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test('B1: a key the run created and could not remove is a SafetyError thrown after the helper closes; an exe the run never launched is not removed', async () => {
+    const dir = tmp();
+    try {
+        const reg = fakeRegistry();
+        const guard = new ShellMenuGuard({ exec: reg.exec, platform: 'win32' });
+        const leg = unpackagedLeg(dir, reg, guard, {
+            id: 'T-MENU-STUCK',
+            exe: 'C:\\scratch\\stuck\\floe-desktop.exe',
+        });
+        await leg.launch([]);
+        const client = leg.client;
+        leg.ownClient = true;
+        reg.brokenDeletes = true;
+        await assert.rejects(leg.stop('test'), (err) => {
+            assert.ok(err instanceof SafetyError, err.stack);
+            assert.match(
+                err.message,
+                /was absent before the run and is still there after the delete/
+            );
+            assert.ok(client.helperClosed, 'thrown after the helper is closed');
+            return true;
+        });
+        assert.ok(!activeLegs.has(leg));
+
+        // The app registered a path this process knows nothing about.
+        const reg2 = fakeRegistry();
+        const guard2 = new ShellMenuGuard({
+            exec: reg2.exec,
+            platform: 'win32',
+        });
+        const other = unpackagedLeg(dir, reg2, guard2, {
+            id: 'T-MENU-OTHER',
+            exe: 'C:\\scratch\\other\\floe-desktop.exe',
+            registeredAs: 'D:\\elsewhere\\floe-desktop.exe',
+        });
+        await other.launch([]);
+        await other.stop('test');
+        assert.deepEqual(
+            reg2.menu(),
+            SELF_HEAL('D:\\elsewhere\\floe-desktop.exe'),
+            'left exactly as it is'
+        );
+        assert.ok(
+            other.notes.some((n) =>
+                n.includes('is not for an exe this run launched; left alone')
+            ),
+            other.notes.join('\n')
+        );
+    } finally {
+        dropLegs(/^T-MENU-/);
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// Up to the second review of #542 a Store leg never read the key at all. A
+// packaged launch does not touch it, but the Store exe started directly is
+// the one launch whose package identity no run has shown, and a Floe without
+// identity registers the verb for itself (finding H). So the Store lane reads
+// it once, writes nothing when the launch left it alone, and puts it back
+// when the launch rewrote it. A wailsdev leg starts nothing and reads nothing.
+test('a Store leg guards the Explorer verb and writes only when its launch changed it; a wailsdev leg never touches it', async () => {
     const dir = tmp();
     const savedAppData = process.env.APPDATA;
     const reg = fakeRegistry(ORIGINAL_MENU);
@@ -1718,7 +2190,9 @@ test('Store and wailsdev legs never touch the Explorer verb', async () => {
         mkdirSync(path.dirname(cfg), { recursive: true });
         const original = Buffer.from('{"reportStats":true,"migrated":true}\n');
         writeFileSync(cfg, original);
+        const OWNER_RECORD = ownerStateFor(path.join(dir, 'owner-out'));
         const store = new DesktopLeg({
+            allowForeground: true,
             role: 'receiver',
             cellId: 'T-MENU-STORE',
             input: 'code',
@@ -1730,12 +2204,49 @@ test('Store and wailsdev legs never touch the Explorer verb', async () => {
             shellMenu: guard,
             launcher: async () => ({ child: null, pid: null }),
             infra: INFRA_NOWHERE,
+            shared: { ownerState: OWNER_RECORD },
         });
         await store.launch([]);
         assert.equal(store.guard.state().applied, true);
+        assert.equal(store.shellMenuArmed, true);
+        assert.equal(guard.state, 'armed');
+        // The Store build runs on the owner's profile, so its driver is the
+        // one that gets the record of the owner's own folders.
+        assert.equal(store.driver.ownerState, OWNER_RECORD);
         await store.stop('test');
         assert.ok(readFileSync(cfg).equals(original));
+        assert.equal(reg.writes + reg.deletes, 0, 'a launch that left the key alone costs reads only');
+        assert.deepEqual(reg.menu(), ORIGINAL_MENU);
+        assert.ok(store.notes.some((n) => n === 'explorer verb: unchanged'), store.notes.join(' | '));
+
+        // The launch ran without identity and pointed the verb at itself.
+        const direct = new DesktopLeg({
+            allowForeground: true,
+            role: 'receiver',
+            cellId: 'T-MENU-STORE-DIRECT',
+            input: 'code',
+            code: 'a-b-c',
+            outDir: path.join(dir, 'out2'),
+            build: { launch: 'store' },
+            uia: fakeUiaClient(`${WINDOWS_APPS}x\\floe-desktop.exe`),
+            lister: NO_PROCS,
+            shellMenu: guard,
+            launcher: async () => {
+                reg.set(SELF_HEAL(`${WINDOWS_APPS}x\\floe-desktop.exe`));
+                return { child: null, pid: null };
+            },
+            infra: INFRA_NOWHERE,
+        });
+        await direct.launch([]);
+        assert.notDeepEqual(reg.menu(), ORIGINAL_MENU);
+        await direct.stop('test');
+        assert.deepEqual(reg.menu(), ORIGINAL_MENU, "the owner's entry is back");
+        assert.equal(reg.writes, 1);
+        assert.ok(readFileSync(cfg).equals(original));
+
+        const before = reg.calls.length;
         const wailsdev = new DesktopLeg({
+            allowForeground: true,
             role: 'sender',
             cellId: 'T-MENU-WAILSDEV',
             files: ['a'],
@@ -1759,9 +2270,8 @@ test('Store and wailsdev legs never touch the Explorer verb', async () => {
             }),
         });
         await wailsdev.launch();
-        assert.equal(store.shellMenuArmed || wailsdev.shellMenuArmed, false);
-        assert.equal(guard.state, 'unread');
-        assert.equal(reg.calls.length, 0, 'no registry call at all');
+        assert.equal(wailsdev.shellMenuArmed, false);
+        assert.equal(reg.calls.length, before, 'a wailsdev leg makes no registry call at all');
     } finally {
         if (savedAppData === undefined) delete process.env.APPDATA;
         else process.env.APPDATA = savedAppData;
@@ -2152,7 +2662,13 @@ test('aggregateProbes maps P1/P6/P9 to the gates and leaves unknowns null', () =
     assert.equal(full.saveDirSettable, true);
     assert.equal(full.senderDrivable, true);
     assert.equal(full.present, true);
-    assert.equal(full.focusNeeded, false);
+    // An exe lane: every UIA pattern call activates the window (G2-F1).
+    assert.equal(full.focusNeeded, true);
+    assert.equal(aggregateProbes([], { mode: 'wailsdev' }).focusNeeded, false);
+    assert.equal(
+        aggregateProbes([], { mode: 'portable', userAway: true }).present,
+        false
+    );
     assert.equal(full.mode, 'store');
     assert.equal(full.saveDirOriginal, 'D:\\x');
     assert.equal(
@@ -2286,6 +2802,8 @@ test('probe() never throws and names its probes; store paths sit under WindowsAp
         probe: 'P2',
         build: { launch: 'portable' },
         out: null,
+        // Past the launcher's own stop, to the missing exe this is about.
+        allowForeground: true,
     });
     assert.equal(failing.probe, 'P2');
     assert.equal(failing.verdict, 'error');
@@ -3119,4 +3637,245 @@ test('wailsdev relay cell: Hide my IP is set through Settings, proved by GetSett
     await p.leg.start();
     assert.ok(!p.driver.calls.some((c) => c[0] === 'set-toggle'));
     await p.leg.stop('test');
+});
+
+// Review of #542, finding 2: a second guard that reads desktop.json while the
+// first has not restored it takes the audit's edit for the owner's original.
+test('DesktopConfigGuard refuses to edit a desktop.json another guard of this run still holds, and takes it once that one has restored', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'lta-guard-overlap-'));
+    try {
+        const file = path.join(dir, 'desktop.json');
+        const original = JSON.stringify({ server: 'https://owner.example', reportStats: true });
+        writeFileSync(file, original);
+        const mk = () =>
+            new DesktopConfigGuard({
+                configPath: file,
+                edit: { server: 'https://audit.example', web: '', hideIP: false },
+                evidenceDir: null,
+                processes: async () => [],
+            });
+        const first = mk();
+        await first.apply();
+        assert.notEqual(readFileSync(file, 'utf8'), original, 'edited');
+        const second = mk();
+        await assert.rejects(second.apply(), (e) => {
+            assert.equal(e.name, 'PreconditionError');
+            assert.match(e.message, /still edited by an earlier leg of this run/);
+            return true;
+        });
+        assert.equal(second.applied, false);
+        first.restore();
+        assert.equal(readFileSync(file, 'utf8'), original);
+        await second.apply();
+        second.restore();
+        assert.equal(readFileSync(file, 'utf8'), original, "the owner's file, not the first guard's edit");
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// Finding 10: cleanup replayed the backup even when the run had restored the
+// file itself, rolling back whatever the owner changed in Settings since.
+test('restoreConfig leaves desktop.json alone when the run already put it back', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'lta-restored-'));
+    try {
+        const file = path.join(dir, 'desktop.json');
+        const backup = path.join(dir, 'desktop.json.bak');
+        writeFileSync(backup, '{"reportStats":true}');
+        writeFileSync(file, '{"reportStats":true,"changedByTheOwnerSince":true}');
+        const r = await restoreConfig(
+            { backup, configPath: file, restored: true },
+            { lister: async () => [] }
+        );
+        assert.deepEqual([r.ok, r.written], [true, false]);
+        assert.match(r.detail, /already put desktop\.json back/);
+        assert.equal(readFileSync(file, 'utf8'), '{"reportStats":true,"changedByTheOwnerSince":true}');
+        // Not restored by the run (null, or a mismatch): the backup is replayed.
+        const again = await restoreConfig(
+            { backup, configPath: file, restored: null },
+            { lister: async () => [] }
+        );
+        assert.equal(again.written, true);
+        assert.equal(readFileSync(file, 'utf8'), '{"reportStats":true}');
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// Second review of #542, finding F: the code Receive half of the leftover
+// rule, and the order "mark changed, then set", had no test. Reverting either
+// left every suite green.
+test("a code Receive that finds an earlier audit's folder in its save field never takes it for the owner's, and marks the field changed before the set", async () => {
+    const out = tmp();
+    try {
+        const LEFT = 'C:\\Temp\\lta\\20261012-200000-shipped-default\\cells\\S-DIR-C2D\\attempt-1\\out';
+        const receiver = (over, values) => {
+            const state = {
+                values: { [STRINGS.saveDirPlaceholder]: values },
+                texts: ['READY', 'Enter a code or link, then click Receive.'],
+                buttons: ['SEND', 'RECEIVE', 'Browse', 'Receive'],
+            };
+            state.onClick = (name, opts) => {
+                if (sameText(name, 'Receive') && opts.after === STRINGS.codePlaceholder)
+                    state.texts = ['ACTIVE', STRINGS.connecting, 'KEEP THIS WINDOW OPEN. CLOSING IT CANCELS THE TRANSFER.'];
+            };
+            const made = legWith(
+                { role: 'receiver', input: 'code', code: 'olive-tiger-castle', outDir: 'C:\\out\\a1', ...over },
+                state
+            );
+            return { ...made, state };
+        };
+
+        // No record anywhere: the leftover goes back to the app's default.
+        let r = receiver({ build: { launch: 'portable', path: 'x' } }, LEFT);
+        await r.leg.start();
+        assert.equal(r.leg.saveDir.original, '', 'not the leftover');
+        assert.equal(r.leg.saveDir.leftover, LEFT);
+        assert.ok(r.leg.notes.some((n) => n.includes('an earlier audit\'s own folder') && n.includes('goes back to empty')), r.leg.notes.join(' | '));
+        await r.leg.restoreSaveDir();
+        assert.equal(r.state.values[STRINGS.saveDirPlaceholder], '');
+        assert.equal(r.leg.saveDir.restored, true);
+
+        // On the Store lane the owner's own folder is kept under --out ...
+        const state1 = ownerStateFor(out);
+        r = receiver({ build: { launch: 'store' }, ownerState: state1 }, 'D:\\owner\\Floe');
+        await r.leg.start();
+        assert.equal(r.leg.saveDir.original, 'D:\\owner\\Floe');
+        assert.equal(ownerStateFor(out).recall('receiveSaveDir').value, 'D:\\owner\\Floe');
+        // ... and put back by a later command that finds a leftover there.
+        r = receiver({ build: { launch: 'store' }, ownerState: ownerStateFor(out) }, LEFT);
+        await r.leg.start();
+        assert.equal(r.leg.saveDir.original, 'D:\\owner\\Floe');
+        assert.equal(r.leg.saveDir.leftover, LEFT);
+        assert.equal(r.leg.saveDir.recalled, true);
+        await r.leg.restoreSaveDir();
+        assert.equal(r.state.values[STRINGS.saveDirPlaceholder], 'D:\\owner\\Floe');
+
+        // A portable exe has a profile of its own: its field is never kept as
+        // the owner's, and the Store record is never read for it.
+        r = receiver({ build: { launch: 'portable', path: 'x' }, ownerState: ownerStateFor(out) }, 'E:\\portable profile');
+        await r.leg.start();
+        assert.equal(ownerStateFor(out).recall('receiveSaveDir').value, 'D:\\owner\\Floe');
+        r = receiver({ build: { launch: 'portable', path: 'x' }, ownerState: ownerStateFor(out) }, LEFT);
+        await r.leg.start();
+        assert.equal(r.leg.saveDir.original, '');
+        assert.equal(r.leg.saveDir.recalled, false);
+
+        // The set's answer can be lost after the value has landed. The field
+        // is marked changed before the call, so the stop still puts it back.
+        r = receiver({ build: { launch: 'portable', path: 'x' } }, 'D:\\owner\\Floe');
+        const set = r.driver.setValue.bind(r.driver);
+        r.driver.setValue = async (placeholder, value, opts) => {
+            const answer = await set(placeholder, value, opts);
+            if (placeholder === STRINGS.saveDirPlaceholder && value === 'C:\\out\\a1')
+                throw Object.assign(new Error('helper timeout after 30000 ms'), { reason: 'timeout' });
+            return answer;
+        };
+        await assert.rejects(r.leg.start(), /helper timeout/);
+        assert.equal(r.state.values[STRINGS.saveDirPlaceholder], 'C:\\out\\a1', 'the value landed');
+        assert.equal(r.leg.saveDir.changed, true, 'and the leg knows it has something to put back');
+        r.driver.setValue = set;
+        await r.leg.restoreSaveDir();
+        assert.equal(r.state.values[STRINGS.saveDirPlaceholder], 'D:\\owner\\Floe');
+    } finally {
+        dropLegs(/./);
+        rmSync(out, { recursive: true, force: true });
+    }
+});
+
+// Third review of #542: no test executed P9, the probe that types into the
+// code Receive folder and puts it back, and it runs in the first command of
+// a session. With its restore changed to write the raw read back, every
+// suite stayed green.
+test('P9 on fakes: the folder goes back to what the owner had, and a folder an earlier audit left there never does', async () => {
+    const dir = tmp();
+    // One window for both launches of the probe: the field outlives a close,
+    // as the app's own remembered folder does.
+    const windowWith = (value) => {
+        const win = { value, sets: [], open: false };
+        win.client = {
+            log() {},
+            async findWindow() {
+                win.open = true;
+                return { hwnd: 4242, pid: 0, exe: 'C:\\bogus\\floe-desktop.exe', minimized: false, visible: true };
+            },
+            async waitTree() {
+                return { ready: true };
+            },
+            async readText() {
+                return { texts: [], count: 0 };
+            },
+            async retry() {
+                return {};
+            },
+            async request(cmd, params = {}) {
+                if (!win.open) throw Object.assign(new Error('not-a-window'), { reason: 'not-a-window' });
+                if (cmd === 'foreground-check') return { foreground: false, idleSeconds: 999 };
+                if (cmd === 'get-value') return { value: win.value, matchedBy: 'name' };
+                if (cmd === 'set-value') {
+                    const before = win.value;
+                    win.value = params.value;
+                    win.sets.push(params.value);
+                    return { before, after: params.value, matchedBy: 'name' };
+                }
+                return {};
+            },
+            async capture() {
+                return { path: null };
+            },
+            async closeWindow() {
+                win.open = false;
+                return { posted: true };
+            },
+            async show() {
+                return { wasIconic: false, iconic: false };
+            },
+            async close() {
+                return null;
+            },
+        };
+        return win;
+    };
+    const p9 = (win, out) =>
+        probe({
+            probe: 'P9',
+            build: { launch: 'portable', path: 'C:\\bogus\\floe-desktop.exe' },
+            scratch: dir,
+            out,
+            allowForeground: true,
+            uia: win.client,
+            lister: NO_PROCS,
+            launcher: async () => ({ child: null, pid: null }),
+            shellMenu: new ShellMenuGuard({ platform: 'linux' }),
+            monitor: 'off',
+            infra: INFRA_NOWHERE,
+        });
+    try {
+        const out = path.join(dir, 'out');
+        const typed = path.join(out, 'p9-save-dir');
+
+        // The owner's own folder: typed over, put back, still there after a
+        // relaunch.
+        const own = windowWith('D:\\owner\\Floe');
+        const a = await p9(own, out);
+        assert.equal(a.verdict, 'restored-across-relaunch', JSON.stringify(a));
+        assert.deepEqual(own.sets, [typed, 'D:\\owner\\Floe']);
+        assert.equal(own.value, 'D:\\owner\\Floe');
+        assert.equal(a.detail.original, 'D:\\owner\\Floe');
+        assert.equal(a.detail.leftover, undefined);
+
+        // A probe that died between its set and its restore left its own
+        // folder in the field. That is not what goes back.
+        const left = windowWith(typed);
+        const b = await p9(left, out);
+        assert.deepEqual(left.sets, [typed, '']);
+        assert.equal(left.value, '', "the app's default, not the audit's folder");
+        assert.equal(b.detail.leftover, typed);
+        assert.equal(b.detail.original, '');
+        assert.equal(b.verdict, 'restored-across-relaunch');
+        assert.ok(b.notes.some((n) => n.includes("an earlier audit's own folder")), b.notes.join(' | '));
+    } finally {
+        dropLegs(/./);
+        rmSync(dir, { recursive: true, force: true });
+    }
 });

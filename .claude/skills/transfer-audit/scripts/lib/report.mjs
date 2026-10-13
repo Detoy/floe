@@ -304,6 +304,25 @@ function desktopJsonState(d = {}) {
     return 'desktop.json: not edited (no Store-mode leg)';
 }
 
+/**
+ * The "desktop app put back as found" row. It answers yes only for what was
+ * measured: every built app this run started was closed by a stop that read
+ * its own results back. A run that launched none says so, and a launch whose
+ * stop had not finished when the report was written is a NO, not a yes by
+ * default (second review of #542, finding E).
+ */
+export function putBackRow(s) {
+    const legs = s.desktopLegs || { launched: 0, stopped: 0, problems: [] };
+    const problems = [...(s.desktopNotReleased || []), ...(legs.problems || [])];
+    if (legs.stopped < legs.launched)
+        problems.push(
+            `${legs.launched - legs.stopped} of ${legs.launched} launched app(s) had not finished stopping when this was written`
+        );
+    if (problems.length) return `NO: ${problems.join(' | ')}`;
+    if (!legs.launched) return 'n/a (no built app was launched)';
+    return `yes (${legs.stopped} of ${legs.launched} launched app(s) closed by themselves, with what the run set read back)`;
+}
+
 export function safetyRows(s) {
     const ok = (v) => (v === null || v === undefined ? 'n/a' : v);
     const killed =
@@ -346,7 +365,19 @@ export function safetyRows(s) {
             'captures',
             `${s.captures?.count ?? 0}, ${s.captures?.allCropped === false ? 'NOT all cropped' : 'all cropped to window'}`,
         ],
-        ['forced foreground', `${s.forcedFocus ?? 0} times`],
+        [
+            // Each one activates the app's window (G2-F1). Counted by the
+            // driver; 0 on a run that drove no built app.
+            'window activations (UIA pattern calls on a built app)',
+            String(s.desktopCalls?.exe ?? 0),
+        ],
+        ['desktop app put back as found', putBackRow(s)],
+        [
+            'input idle check before desktop calls',
+            s.idleCheckOff
+                ? 'OFF (--no-idle-check: the owner said in the session that the app may be driven while they use the PC)'
+                : 'on',
+        ],
         ['processes killed', killed],
         [
             'working tree',
@@ -639,7 +670,14 @@ export function newSafety() {
         turnBodyPrinted: false,
         serverEnvRead: false,
         captures: { count: 0, allCropped: true },
-        forcedFocus: 0,
+        // Pattern calls sent to a built app, counted by UiaDriver through
+        // shared.desktopCalls (the same object).
+        desktopCalls: { exe: 0 },
+        // One line per cell whose host release left something behind.
+        desktopNotReleased: [],
+        // Built apps this run started and closed, and what a close left
+        // behind (DesktopLeg._stop writes it through shared.desktopLegs).
+        desktopLegs: { launched: 0, stopped: 0, problems: [] },
         killedPids: [],
         workingTreeUnchanged: null,
         saveDirRestored: null,

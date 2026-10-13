@@ -11,9 +11,15 @@
 // rows apply unchanged. TA-16 (flow accept, request.visitor 'cli') runs the
 // same attempt with the CLI as the visitor: `floe send <files> --to <link>`
 // through the CLI adapter's own leg (lib/cli.mjs, opts.requestLink), whose
-// exit and printed lines stand in for the web visitor's status card.
+// exit and printed lines stand in for the web visitor's status card; the
+// auto flow takes the CLI visitor too (S-DIR-C2D-reqauto).
 // runOpenLinkAttempt runs TA-17: the quick cell's own attempt, with the host
 // holding a link open beside it (runAttempt hooks).
+//
+// On an exe host (the UIA request verbs) no Invoke presses Accept or Decline,
+// so a prompted flow ends as SKIP request-accept-undrivable once its prompt
+// is on record; the auto flow is the one that delivers there. On the Store
+// build the release also puts the Make link form's Save to field back.
 //
 // The link is a secret for its life: the full value goes to the visitor's
 // page.goto and nowhere else. The record carries the redacted form, every
@@ -31,10 +37,18 @@ import path from 'node:path';
 import {
     attemptTimeout,
     describeError,
+    recordDesktopConfig,
     runAttempt,
     statsProofCheck,
 } from './cell.mjs';
-import { RE, REQUEST_STRINGS, desktopFmtBytes, safeCode, samePath } from './desktop.mjs';
+import {
+    NOT_RELEASED,
+    RE,
+    REQUEST_STRINGS,
+    desktopFmtBytes,
+    safeCode,
+    samePath,
+} from './desktop.mjs';
 import { compareOutputs, ensureFixture, walkOutputs } from './fixtures.mjs';
 import { REQUEST_CADDY_RECONNECT_MS, isLoopbackUrl } from './matrix.mjs';
 import { redactRequestLinks } from './report.mjs';
@@ -308,12 +322,23 @@ async function startHost(
         label: 'host',
         monitor: ctx.monitor ?? 'secondary',
         userAway: Boolean(ctx.userAway),
+        allowForeground: Boolean(ctx.allowForeground),
+        noIdleCheck: Boolean(ctx.noIdleCheck),
         shared: ctx.shared || {},
         clientDir: ctx.shared?.clientDir ?? null,
         log: ctx.log,
     });
     const exe = host.mode !== 'wailsdev';
     if (exe) {
+        // An earlier cell left the owner's app changed (markHostRelease):
+        // nothing more is launched on it in this run. DesktopLeg.launch has
+        // the same stop for every other desktop leg.
+        if (ctx.shared?.desktopNotReleased)
+            throw new PhaseError(
+                'host.start',
+                `${NOT_RELEASED}: an earlier cell of this run could not put the desktop app back as it found it (${ctx.shared.desktopNotReleased}); no host was launched`,
+                { verdict: 'SKIP', reason: NOT_RELEASED }
+            );
         // The matrix gate SKIPs this without --user-away; this is the
         // runner's own stop, before anything launches.
         if (!ctx.userAway)
@@ -331,8 +356,12 @@ async function startHost(
     // audit's interrupt shutdown) closes the link and puts the address back.
     host.beforeClose = () => releaseHost(st, rec);
     await host.launch([]);
-    // Every UIA pattern call from here on re-reads the input idle time first.
-    if (exe && host.driver) host.driver.awayOnly = true;
+    // In the manifest at once, as every plain leg's pid is (lib/cell.mjs):
+    // a run that is killed mid-cell leaves `cleanup` the pid to end.
+    if (ctx.onPid && host.pid) ctx.onPid(host.pid, `${cell.id}:host`);
+    // Every UIA pattern call from here on re-reads the input idle time first,
+    // unless the run said not to (--no-idle-check).
+    if (exe && host.driver && !ctx.noIdleCheck) host.driver.awayOnly = true;
     await clearLeftover(host, ctx, rec, st);
     await host.applyRelayForcer();
     rec.request.tab = await awaitRequestTab(host, st.clock);
@@ -374,6 +403,26 @@ async function startHost(
         ctx.shared = ctx.shared || {};
         ctx.shared.requestLimited = true;
         throw dailyLimit('the server answered Make link with limited');
+    } finally {
+        // B2: on the Store lane the Save to field's old value goes to the
+        // log the moment the driver knows it. releaseHost puts it back; a
+        // run that dies before then still leaves the owner what to restore.
+        const before =
+            host.mode === 'store' &&
+            typeof host.driver?.requestSaveDirBefore === 'function'
+                ? host.driver.requestSaveDirBefore()
+                : null;
+        if (before !== null && ctx.log) {
+            const left =
+                typeof host.driver.requestSaveDirLeftover === 'function'
+                    ? host.driver.requestSaveDirLeftover()
+                    : null;
+            ctx.log(
+                left && left.leftover
+                    ? `${cell.id}: the Make link form's Save to field held ${JSON.stringify(left.leftover)} before this cell, an earlier audit's own folder; the release sets ${JSON.stringify(before)} (${left.recalled ? "the owner's folder as an earlier command read it" : "the app's default"})`
+                    : `${cell.id}: the Make link form's Save to field read ${JSON.stringify(before)} before this cell; it is put back when the host is released`
+            );
+        }
     }
     const read = await host.driver.readRequestLink();
     st.link = read.link;
@@ -399,6 +448,11 @@ async function releaseHost(st, rec) {
     st.released = true;
     const { host } = st;
     const { now, nap } = st.clock;
+    // Putting the owner's app back is never refused for want of 120 s of
+    // idle input: these steps wait for a short pause instead (desktop.mjs
+    // RELEASE_QUIET_S), and what could not be sent is a release failure
+    // below, with what to set by hand.
+    if (host?.driver) host.driver.releasing = true;
     const note = (l) => rec.notes.push(scrub(l));
     const fail = (l) => {
         note(l);
@@ -425,6 +479,45 @@ async function releaseHost(st, rec) {
         }
     } catch (e) {
         fail(`host release: ${e.message}`);
+    }
+    // B2: the Store app is the one exe on the owner's own profile, where the
+    // Save to folder a cell typed into the Make link form outlives the run
+    // (UiaDriver.restoreRequestSaveDir). Put back what the field read before,
+    // once the link is closed or its result put away, whoever made the link.
+    if (
+        host.mode === 'store' &&
+        typeof host.driver?.restoreRequestSaveDir === 'function'
+    ) {
+        const undone =
+            'the Save to field of the Make link form was not put back';
+        try {
+            const back = await host.driver.restoreRequestSaveDir();
+            if (back.restored !== null) {
+                rec.request.saveTo = {
+                    before: back.before,
+                    restored: back.restored,
+                };
+                if (back.leftover) {
+                    rec.request.saveTo.leftover = back.leftover;
+                    if (back.recalled) rec.request.saveTo.recalled = true;
+                    note(
+                        back.recalled
+                            ? `host release: when this cell started the Save to field held "${back.leftover}", an earlier audit's own folder and not the owner's choice; it was set to "${back.before}", the owner's folder as an earlier command of this --out read it`
+                            : `host release: when this cell started the Save to field held "${back.leftover}", an earlier audit's own folder and not the owner's choice; it was set to empty, the app's default`
+                    );
+                }
+                if (!back.restored)
+                    fail(
+                        `host release: ${undone} (it reads "${back.after}", not "${back.before}"); set it by hand on Receive > Request link`
+                    );
+            }
+        } catch (e) {
+            const before = host.driver.requestSaveDirBefore();
+            rec.request.saveTo = { before, restored: false };
+            fail(
+                `host release: ${undone} (${e.message}); it read "${before ?? ''}" before the cell, set it by hand on Receive > Request link`
+            );
+        }
     }
     if (st.addresses) {
         try {
@@ -466,12 +559,48 @@ function releaseProblems(st) {
  * keeps its own finding and gets the same words as a note.
  */
 export const HOST_RELEASE_KEY = 'host-release';
-function markHostRelease(rec, problems) {
+/** How long teardown lets a timed-out host.start finish before it releases. */
+export const START_SETTLE_MS = 15_000;
+/**
+ * A host.start that lost its race with the phase timer may still be making
+ * its link. Teardown lets it finish, inside a bound, so the release sees the
+ * link it made and closes it instead of reading "nothing of ours here". Both
+ * kinds of request cell go through here: the plain attempt and the quick
+ * cell with a link held open (TA-17), which used to release at once.
+ */
+export async function hostStartSettled(st, ctx) {
+    if (!st || !st.starting) return;
+    await Promise.race([
+        st.starting.catch(() => {}),
+        ((ctx && ctx.sleep) || defaultSleep)(START_SETTLE_MS),
+    ]);
+}
+function markHostRelease(
+    rec,
+    problems,
+    st = null,
+    ctx = null,
+    cellId = rec.cellId
+) {
     if (!problems.length) return;
     const first = (s) => String(s).split(/\r?\n/)[0].trim();
     const text = scrub(
         `${HOST_RELEASE_KEY}: the host was not left as found (${problems.map(first).join('; ')}); the next desktop-host cell would inherit it`
     );
+    // On an exe lane that is the owner's own app (the Store build runs on
+    // their profile), so the run launches nothing more on the desktop:
+    // DesktopLeg.launch reads this and stops as SKIP desktop-not-released.
+    if (st?.host && st.host.mode !== 'wailsdev' && ctx) {
+        ctx.shared = ctx.shared || {};
+        if (!ctx.shared.desktopNotReleased)
+            ctx.shared.desktopNotReleased = problems.map(first).join('; ');
+    }
+    // In the Safety table whatever the cell's own verdict is: a SKIP or a
+    // FAIL keeps its finding, and this would otherwise be one note.
+    if (ctx?.safety && Array.isArray(ctx.safety.desktopNotReleased))
+        ctx.safety.desktopNotReleased.push(
+            scrub(`${cellId ?? 'request host'}: ${problems.map(first).join('; ')}`)
+        );
     if (!rec.ok) {
         rec.notes.push(text);
         return;
@@ -678,16 +807,40 @@ async function runFlow(cell, ctx, rec, st, fixture, T) {
     if (req.flow === 'auto') {
         // TA-10a (D-173): while the automatic link waits, the chip reads
         // AUTO-ACCEPT (H4); then the drop starts by itself, with no prompt
-        // at any point, and nothing is clicked on the host.
+        // at any point, and nothing is clicked on the host. The visitor is
+        // a web page, or the CLI (S-DIR-C2D-reqauto), which joins and waits
+        // by itself as in TA-16.
+        const cli = req.visitor === 'cli';
         const pill = await host.driver.readText(RE.pillAuto);
-        rec.request.auto = { pill: pill[0] ?? null, started: null };
-        if (!pill.some((w) => w.toLowerCase() === REQUEST_STRINGS.autoAcceptPill.toLowerCase()))
+        rec.request.auto = {
+            pill: pill[0] ?? null,
+            started: null,
+            proof: null,
+        };
+        if (
+            !pill.some(
+                (w) =>
+                    w.toLowerCase() ===
+                    REQUEST_STRINGS.autoAcceptPill.toLowerCase()
+            )
+        )
             throw flow(
                 'request',
                 `the header chip reads ${JSON.stringify(pill[0] ?? null)} while the automatic link waits, not AUTO-ACCEPT`
             );
-        const v = await open('visitor-1');
-        await v.send(st.clock);
+        let v = cli ? null : await open('visitor-1');
+        // The app reads the drive a moment after Make link (requestauto.go
+        // watchAutoSpace) and then says so on the link: below the floor an
+        // unattended drop must leave, every drop asks. Named here, before
+        // anything is sent, instead of as a prompt nobody answers.
+        const waiting = await snapshotOf(host);
+        if (waiting.autoAsks)
+            throw flow(
+                'request',
+                `the link now reads Asks first (${safeCode(waiting.autoAsks)}): the drive under the run folder is below the free space an unattended drop must leave, so every drop on it asks. Point --out at an NTFS drive with more room`
+            );
+        if (cli) v = await newCliVisitor(cell, ctx, rec, st, fixture);
+        else await v.send(st.clock);
         // A small drop can finish between two polls, so done counts too; a
         // prompt at any point is the finding.
         const s = await awaitHostState(
@@ -1071,13 +1224,31 @@ async function verifyRequest(cell, ctx, rec, st, fixture, T) {
         );
     // TA-10a: the host's own record says the link took the drop by itself
     // (History's HA1 line reads this mark); a prompted drop is never marked.
+    // An exe shows no such record on the done view, so there the proof is
+    // what the lane did see: the link block said "Accepts automatically"
+    // when it was made (the driver's autoAccept), and the drop then started
+    // with no prompt on record and no answer given, which on a lane that
+    // cannot press Accept means nobody accepted it. autoAccepted stays null:
+    // the mark itself is the dev page lane's oracle.
     if (cell.request.flow === 'auto') {
         rec.request.result.autoAccepted = r.autoAccepted ?? null;
-        if (snap.autoAccept !== true || r.autoAccepted !== true)
+        if (uia) {
+            if (
+                snap.autoAccept !== true ||
+                rec.request.prompts.length ||
+                rec.request.answers.length
+            )
+                throw flow(
+                    'verify',
+                    `the drop is not proven automatic (link said Accepts automatically ${snap.autoAccept === true}, prompts ${rec.request.prompts.length}, answers ${rec.request.answers.length})`
+                );
+        } else if (snap.autoAccept !== true || r.autoAccepted !== true)
             throw flow(
                 'verify',
                 `the host's result is not marked as accepted automatically (link autoAccept ${snap.autoAccept === true}, result autoAccepted ${r.autoAccepted === true})`
             );
+        if (rec.request.auto)
+            rec.request.auto.proof = uia ? 'link-block' : 'host-record';
     } else if (r.autoAccepted === true)
         throw flow('verify', 'the host marked a drop it prompted for as accepted automatically');
     const view = await host.driver.readRequestResult();
@@ -1199,6 +1370,9 @@ function newRequestRecord(cell) {
         usedUp: null,
         // TA-16: the CLI visitor's exit code (web cells leave it null).
         visitorExit: null,
+        // B2, Store lane only: what the Make link form's Save to field read
+        // before the cell, and whether the release put it back.
+        saveTo: null,
         released: null,
         swept: null,
     };
@@ -1386,13 +1560,16 @@ export async function runRequestAttempt(cell, ctx, n) {
                     );
             });
         }
-        await phase('host.start', T.link + 30_000, () =>
-            startHost(cell, ctx, rec, st, {
-                outDir: st.outDir,
-                relayOnly: cell.receiver.relayOnly,
-                blipUrl,
-                proxyKey,
-            })
+        await phase(
+            'host.start',
+            T.link + 30_000,
+            () =>
+                (st.starting = startHost(cell, ctx, rec, st, {
+                    outDir: st.outDir,
+                    relayOnly: cell.receiver.relayOnly,
+                    blipUrl,
+                    proxyKey,
+                }))
         );
         const requestMs =
             T.accept +
@@ -1493,6 +1670,7 @@ export async function runRequestAttempt(cell, ctx, n) {
                     }
                 }
                 if (st.host) {
+                    await hostStartSettled(st, ctx);
                     try {
                         // stop() runs releaseHost first (beforeClose).
                         await st.host.stop(rec.ok ? 'done' : 'failed');
@@ -1526,7 +1704,7 @@ export async function runRequestAttempt(cell, ctx, n) {
         } catch (e) {
             rec.notes.push(scrub(`teardown: ${e.message}`));
         }
-        markHostRelease(rec, releaseProblems(st));
+        markHostRelease(rec, releaseProblems(st), st, ctx);
         // Every visitor's report attempts reach the Safety table, pass or
         // fail; verify only turns them into the cell's verdict.
         if (ctx.safety) {
@@ -1550,6 +1728,9 @@ export async function runRequestAttempt(cell, ctx, n) {
         rec.evidence.captures = [...(hostEv?.captures || [])];
         if (ctx.safety?.captures)
             ctx.safety.captures.count += rec.evidence.captures.length;
+        // The host edited and restored the owner's desktop.json on the Store
+        // lane, as a plain desktop leg does: the Safety row says so.
+        recordDesktopConfig(hostEv, ctx.safety);
         if (
             ctx.ledger &&
             ctx.infra?.name === 'prod' &&
@@ -1624,14 +1805,18 @@ export function openLinkHooks(cell, ctx) {
     return {
         /** What the host release left undone (runOpenLinkAttempt reads it). */
         releaseProblems: () => releaseProblems(st),
+        /** The attempt's state, for the same reader's latch (markHostRelease). */
+        state: () => st,
         async afterSetup(rec) {
             rec.request = newRequestRecord(cell);
             st.drops = path.join(rec.evidenceDir, 'host-drops');
             mkdirSync(st.drops, { recursive: true });
-            await startHost(cell, ctx, rec, st, {
+            // Kept, so a teardown that starts while this is still making its
+            // link can let it finish first (hostStartSettled).
+            await (st.starting = startHost(cell, ctx, rec, st, {
                 outDir: st.drops,
                 relayOnly: false,
-            });
+            }));
         },
         async afterVerify(rec) {
             const snap = await snapshotOf(st.host);
@@ -1647,12 +1832,14 @@ export function openLinkHooks(cell, ctx) {
         async teardown(rec) {
             st.live.on = false;
             if (!st.host) return;
+            await hostStartSettled(st, ctx);
             try {
                 await st.host.stop(rec.ok ? 'done' : 'failed');
             } finally {
                 rec.evidence.host = scrubDeep(safeEvidence(st.host));
                 if (ctx.safety?.captures)
                     ctx.safety.captures.count += (rec.evidence.host?.captures || []).length;
+                recordDesktopConfig(rec.evidence.host, ctx.safety);
                 rec.notes = rec.notes.map(scrub);
             }
         },
@@ -1671,7 +1858,8 @@ export async function runOpenLinkAttempt(cell, ctx, n, opts = {}) {
     const rec = await runAttempt(cell, ctx, n, { ...opts, hooks });
     const problems = hooks.releaseProblems();
     if (problems.length) {
-        markHostRelease(rec, problems);
+        // runAttempt's record carries no cell id of its own.
+        markHostRelease(rec, problems, hooks.state(), ctx, cell.id);
         rec.notes = rec.notes.map(scrub);
         if (rec.evidenceDir) {
             try {

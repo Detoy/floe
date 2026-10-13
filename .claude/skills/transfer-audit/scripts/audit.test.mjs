@@ -25,6 +25,8 @@ import {
     main,
     parseWslList,
     exesUnderTest,
+    foregroundLine,
+    idleCheckLine,
     prepareHarnessBuild,
     probeFirewall,
     prepareWslBuild,
@@ -34,7 +36,10 @@ import {
     purgeRunData,
     readProbe,
     serverFeaturesRow,
+    PROBE_RUN,
     serverFor,
+    unrestoredDesktopLine,
+    unrestoredDesktopRuns,
     webHeadLabel,
     webHeadRow,
 } from './audit.mjs';
@@ -237,6 +242,7 @@ test('run --quick on fake adapters: all PASS, PROGRESS lines, audit.md and run.j
         [
             'run',
             '--quick',
+            '--allow-foreground',
             '--root',
             root,
             '--out',
@@ -696,7 +702,15 @@ test('run default on fake adapters with a FAIL, a FLAKY and NA rows: exit 1, pre
     world.setScript('S-DIR-C2W', 'retry-then-pass');
     const i = io(world, { versions: VERSIONS(true) });
     const code = await main(
-        ['run', '--root', root, '--out', out('default'), '--json'],
+        [
+            'run',
+            '--allow-foreground',
+            '--root',
+            root,
+            '--out',
+            out('default'),
+            '--json',
+        ],
         { ...i, cellHook: shrink }
     );
     assert.equal(code, 1);
@@ -725,19 +739,41 @@ test('exit 5 on SKIP without FAIL, exit 6 on drift only, --strict turns FLAKY in
     };
     const s = io(world, { probe: skipProbe });
     assert.equal(
-        await main(['run', '--quick', '--root', root, '--out', out('skip')], {
-            ...s,
-            cellHook: shrink,
-        }),
+        await main(
+            [
+                'run',
+                '--quick',
+                '--allow-foreground',
+                '--root',
+                root,
+                '--out',
+                out('skip'),
+            ],
+            {
+                ...s,
+                cellHook: shrink,
+            }
+        ),
         5
     );
     assert.ok(s.lines.some((l) => l === 'PROGRESS S-DIR-C2D SKIP'));
     const d = io(fakeWorld(), { versions: VERSIONS(true) });
     assert.equal(
-        await main(['run', '--quick', '--root', root, '--out', out('drift')], {
-            ...d,
-            cellHook: shrink,
-        }),
+        await main(
+            [
+                'run',
+                '--quick',
+                '--allow-foreground',
+                '--root',
+                root,
+                '--out',
+                out('drift'),
+            ],
+            {
+                ...d,
+                cellHook: shrink,
+            }
+        ),
         6
     );
     const w2 = fakeWorld();
@@ -749,6 +785,7 @@ test('exit 5 on SKIP without FAIL, exit 6 on drift only, --strict turns FLAKY in
                 'run',
                 '--quick',
                 '--strict',
+                '--allow-foreground',
                 '--root',
                 root,
                 '--out',
@@ -839,7 +876,17 @@ test('two consecutive infra symptoms skip the rest and exit 3', async () => {
     world.setScript('S-DIR-C2W', 'infra-down');
     const i = io(world);
     const code = await main(
-        ['run', '--quick', '--root', root, '--out', out('infra')],
+        // With the focus change accepted, so C2D below is skipped by the
+        // infra abort and not by the presence gate.
+        [
+            'run',
+            '--quick',
+            '--allow-foreground',
+            '--root',
+            root,
+            '--out',
+            out('infra'),
+        ],
         { ...i, cellHook: shrink, retryCap: 0 }
     );
     assert.equal(code, 3);
@@ -980,6 +1027,7 @@ test('probe subcommand on fake adapters: one line per desktop probe, the aggrega
             'head',
             '--desktop',
             'store',
+            '--allow-foreground',
             '--root',
             root,
             '--out',
@@ -1220,7 +1268,17 @@ test('a Block rule on the Store exe under test is reported in the Infra and Safe
         const i = io(world, { shrinkCells: true, probe: { ...PROBE, firewall } });
         const outDir = out(name);
         const code = await main(
-            ['run', '--quick', '--root', root, '--out', outDir, '--desktop', 'portable'],
+            [
+                'run',
+                '--quick',
+                '--allow-foreground',
+                '--root',
+                root,
+                '--out',
+                outDir,
+                '--desktop',
+                'portable',
+            ],
             { ...i, cellHook: shrink }
         );
         const runs = readdirSync(outDir).filter((d) => /-shipped-quick$/.test(d));
@@ -2076,6 +2134,7 @@ test('a run on another lane re-probes instead of reusing probe.json, and the fil
                 'head',
                 '--desktop',
                 'store',
+                '--allow-foreground',
                 '--root',
                 root,
                 '--out',
@@ -2238,6 +2297,369 @@ test('--dry-run with --caddy exercises the docker tool class once; without it do
     assert.ok(!/docker/.test(without.text));
 });
 
+// ------------------------------------------------ the owner at the PC
+
+// Any UIA pattern call on a built exe activates its window (G2-F1). With
+// neither --user-away nor --allow-foreground, an exe lane launches and drives
+// nothing: the probe's desktop half is recorded as skipped, every cell with a
+// desktop side is SKIP present in the plan, and one line says so up front.
+const presenceFetch = async (url) => {
+    const json = (body) =>
+        new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+        });
+    return String(url).endsWith('/health')
+        ? json({ status: 'healthy', uptime: 5 })
+        : json({ iceServers: [{ urls: ['stun:x:3478'] }] });
+};
+/** io() whose desktop adapter records every probe() and storePackage() call. */
+function presenceIo(world, extra = {}) {
+    const adapters = makeFakeAdapters(world);
+    const seen = { probed: [], reads: 0 };
+    const desktop = {
+        ...adapters.desktop,
+        storePackage: async () => {
+            seen.reads += 1;
+            return { present: true, version: '1.3.0.0' };
+        },
+        probe: async (o) => {
+            seen.probed.push(o);
+            return adapters.desktop.probe(o);
+        },
+    };
+    const i = io(world, {
+        fetchImpl: presenceFetch,
+        getAdapter: async (name) =>
+            name === 'desktop' ? desktop : adapters[name],
+        tryAdapter: async (name) =>
+            name === 'desktop' ? desktop : (adapters[name] ?? null),
+        ...extra,
+    });
+    return { i, seen };
+}
+const NOT_DRIVEN = /^desktop: not launched or driven/;
+
+test('foregroundLine: one line, only for an exe lane with neither flag, naming both', () => {
+    for (const desktop of ['auto', 'store', 'portable']) {
+        const line = foregroundLine({ desktop });
+        assert.match(line, NOT_DRIVEN, desktop);
+        assert.ok(line.includes(`--desktop ${desktop}`), line);
+        assert.match(line, /--user-away/);
+        assert.match(line, /--allow-foreground/);
+        assert.ok(!line.includes('\n'), 'one line');
+        assert.equal(foregroundLine({ desktop, userAway: true }), null);
+        assert.equal(foregroundLine({ desktop, allowForeground: true }), null);
+    }
+    assert.equal(foregroundLine({ desktop: 'wailsdev' }), null);
+    assert.equal(foregroundLine({ desktop: 'none' }), null);
+});
+
+test('probe on a store or portable lane with neither flag never starts the desktop half: it is recorded as skipped (present), and one line says so before anything runs', async () => {
+    for (const lane of ['store', 'portable']) {
+        const { i, seen } = presenceIo(fakeWorld());
+        const outDir = out(`presence-probe-${lane}`);
+        const code = await main(
+            [
+                'probe',
+                '--profile',
+                'head',
+                '--desktop',
+                lane,
+                '--root',
+                root,
+                '--out',
+                outDir,
+            ],
+            i
+        );
+        assert.equal(code, 0, i.lines.concat(i.errors).join('\n'));
+        assert.equal(
+            seen.probed.length,
+            0,
+            `${lane}: desktop.probe was never called`
+        );
+        assert.equal(i.lines[0], 'profile: head');
+        assert.match(i.lines[1], NOT_DRIVEN);
+        assert.match(i.lines[1], /--user-away/);
+        assert.match(i.lines[1], /--allow-foreground/);
+        assert.equal(
+            i.lines.filter((l) => NOT_DRIVEN.test(l)).length,
+            1,
+            'said once'
+        );
+        const text = i.lines.join('\n');
+        assert.match(
+            text,
+            /^probe P1\/P2\/P6\/P8\/P9 desktop: skipped \(present\): /m
+        );
+        assert.ok(
+            !/^probe P1 desktop:/m.test(text),
+            'no per-probe line: none ran'
+        );
+        const probe = JSON.parse(
+            readFileSync(path.join(outDir, 'probe.json'), 'utf8')
+        );
+        assert.equal(probe.desktop.skipped, 'present');
+        assert.equal(probe.desktop.mode, lane);
+        assert.deepEqual(
+            [
+                probe.desktop.available,
+                probe.desktop.receiverDrivable,
+                probe.desktop.saveDirSettable,
+                probe.desktop.senderDrivable,
+            ],
+            [null, null, null, null],
+            'unknown, never false: nothing was tried'
+        );
+        assert.deepEqual(
+            [probe.desktop.present, probe.desktop.focusNeeded],
+            [true, true]
+        );
+        assert.equal(probe.desktop.probes, undefined);
+        assert.match(probe.desktop.detail, /--user-away/);
+
+        // With either flag the half runs as before, and the line is not printed.
+        for (const flag of ['--user-away', '--allow-foreground']) {
+            const next = presenceIo(fakeWorld());
+            const c2 = await main(
+                [
+                    'probe',
+                    '--profile',
+                    'head',
+                    '--desktop',
+                    lane,
+                    flag,
+                    '--root',
+                    root,
+                    '--out',
+                    out(`presence-probe-${lane}${flag}`),
+                ],
+                next.i
+            );
+            assert.equal(c2, 0, next.i.lines.concat(next.i.errors).join('\n'));
+            assert.equal(next.seen.probed.length, 1, `${lane} ${flag}`);
+            assert.equal(next.seen.probed[0].mode, lane);
+            assert.equal(
+                Boolean(next.seen.probed[0].userAway),
+                flag === '--user-away'
+            );
+            assert.ok(!next.i.lines.some((l) => NOT_DRIVEN.test(l)), flag);
+            assert.match(
+                next.i.lines.join('\n'),
+                /^probe P1 desktop: drivable/m
+            );
+        }
+    }
+
+    // --desktop auto resolves its lane by reading the package (no launch),
+    // and the lane it finds is an exe either way.
+    const auto = presenceIo(fakeWorld(), { builds: null });
+    const outAuto = out('presence-probe-auto');
+    assert.equal(
+        await main(
+            ['probe', '--profile', 'head', '--root', root, '--out', outAuto],
+            auto.i
+        ),
+        0,
+        auto.i.lines.concat(auto.i.errors).join('\n')
+    );
+    assert.equal(auto.seen.probed.length, 0);
+    assert.ok(
+        auto.seen.reads >= 1,
+        'Get-AppxPackage is a read, and still made'
+    );
+    assert.match(auto.i.lines[1], NOT_DRIVEN);
+    assert.equal(
+        JSON.parse(readFileSync(path.join(outAuto, 'probe.json'), 'utf8'))
+            .desktop.mode,
+        'store'
+    );
+
+    // The dev page lane and --desktop none are not gated and print no line.
+    for (const lane of ['wailsdev', 'none']) {
+        const w = presenceIo(fakeWorld());
+        const code = await main(
+            [
+                'probe',
+                '--profile',
+                'head',
+                '--desktop',
+                lane,
+                '--root',
+                root,
+                '--out',
+                out(`presence-probe-${lane}`),
+            ],
+            w.i
+        );
+        assert.equal(code, 0, w.i.lines.concat(w.i.errors).join('\n'));
+        assert.equal(w.seen.probed.length, lane === 'wailsdev' ? 1 : 0, lane);
+        assert.ok(!w.i.lines.some((l) => NOT_DRIVEN.test(l)), lane);
+    }
+});
+
+test('run on a portable or store lane with neither flag creates no desktop leg: its cells are SKIP present, the second line says so, the other cells run, and the exit is 5', async () => {
+    for (const lane of ['portable', 'store']) {
+        const world = fakeWorld();
+        const builds =
+            lane === 'store'
+                ? {
+                      ...BUILDS,
+                      desktop: {
+                          kind: 'shipped',
+                          launch: 'store',
+                          version: '3.4.5',
+                          path: null,
+                          isPackaged: true,
+                      },
+                  }
+                : BUILDS;
+        const i = io(world, { builds });
+        const outDir = out(`presence-run-${lane}`);
+        const code = await main(
+            [
+                'run',
+                '--quick',
+                '--root',
+                root,
+                '--out',
+                outDir,
+                '--desktop',
+                lane,
+            ],
+            { ...i, cellHook: shrink }
+        );
+        assert.equal(i.lines[0], 'profile: shipped (default)');
+        assert.match(i.lines[1], NOT_DRIVEN);
+        assert.equal(i.lines.filter((l) => NOT_DRIVEN.test(l)).length, 1);
+        const progress = i.lines.filter((l) => l.startsWith('PROGRESS '));
+        assert.deepEqual(
+            progress.sort(),
+            [
+                'PROGRESS S-DIR-C2D SKIP',
+                'PROGRESS S-DIR-C2W PASS',
+                'PROGRESS S-DIR-D2C SKIP',
+                'PROGRESS S-DIR-W2C PASS',
+                'PROGRESS S-DIR-W2W PASS',
+                'PROGRESS S-REL-W2C PASS',
+            ],
+            i.lines.join('\n')
+        );
+        assert.equal(code, 5, i.lines.join('\n'));
+        assert.equal(
+            world.calls.filter((c) => c.surface === 'desktop').length,
+            0,
+            `${lane}: no desktop leg was ever created`
+        );
+        const runs = readdirSync(outDir).filter((d) =>
+            /-shipped-quick$/.test(d)
+        );
+        const runDir = path.join(outDir, runs[0]);
+        const json = JSON.parse(
+            readFileSync(path.join(runDir, 'run.json'), 'utf8')
+        );
+        const skipped = json.cells.filter((c) => c.verdict === 'SKIP');
+        assert.deepEqual(skipped.map((c) => [c.id, c.reason]).sort(), [
+            ['S-DIR-C2D', 'present'],
+            ['S-DIR-D2C', 'present'],
+        ]);
+        assert.match(
+            readFileSync(path.join(runDir, 'log.txt'), 'utf8'),
+            /desktop: not launched or driven/
+        );
+        const manifest = JSON.parse(
+            readFileSync(path.join(runDir, 'manifest.json'), 'utf8')
+        );
+        assert.deepEqual(
+            [manifest.flags.userAway, manifest.flags.allowForeground],
+            [false, false]
+        );
+
+        // --allow-foreground: the same run drives the desktop, with no idle check asked for.
+        const w2 = fakeWorld();
+        const j = io(w2, { builds });
+        const c2 = await main(
+            [
+                'run',
+                '--quick',
+                '--allow-foreground',
+                '--root',
+                root,
+                '--out',
+                out(`presence-run-${lane}-allowed`),
+                '--desktop',
+                lane,
+            ],
+            { ...j, cellHook: shrink }
+        );
+        assert.equal(c2, 0, j.lines.join('\n'));
+        assert.ok(!j.lines.some((l) => NOT_DRIVEN.test(l)));
+        assert.equal(w2.calls.filter((c) => c.surface === 'desktop').length, 2);
+
+        // --user-away: the same, with the owner declared away.
+        const w3 = fakeWorld();
+        const k = io(w3, { builds });
+        const c3 = await main(
+            [
+                'run',
+                '--quick',
+                '--user-away',
+                '--root',
+                root,
+                '--out',
+                out(`presence-run-${lane}-away`),
+                '--desktop',
+                lane,
+            ],
+            { ...k, cellHook: shrink }
+        );
+        assert.equal(c3, 0, k.lines.join('\n'));
+        assert.ok(!k.lines.some((l) => NOT_DRIVEN.test(l)));
+        assert.equal(w3.calls.filter((c) => c.surface === 'desktop').length, 2);
+    }
+});
+
+test('readProbe does not reuse a probe whose desktop half was skipped for presence once the run may drive the desktop, and still reuses it for a run that may not', () => {
+    const outDir = out('presence-readprobe');
+    mkdirSync(outDir, { recursive: true });
+    const lines = [];
+    const log = (l) => lines.push(l);
+    const stored = {
+        at: new Date().toISOString(),
+        requested: { desktop: 'store', profile: 'shipped' },
+        desktop: { mode: 'store', skipped: 'present', available: null },
+    };
+    writeFileSync(path.join(outDir, 'probe.json'), JSON.stringify(stored));
+    const asked = { desktop: 'store', profile: 'shipped' };
+    assert.ok(
+        readProbe(outDir, log, asked),
+        'a run that drives nothing needs no desktop probe'
+    );
+    assert.equal(lines.length, 0);
+    for (const flags of [{ userAway: true }, { allowForeground: true }]) {
+        assert.equal(
+            readProbe(outDir, log, { ...asked, ...flags }),
+            null,
+            JSON.stringify(flags)
+        );
+        assert.match(lines.at(-1), /skipped the desktop probes .* re-probing/);
+    }
+    // A full probe is reused whatever the flags: the gate is the plan's.
+    writeFileSync(
+        path.join(outDir, 'probe.json'),
+        JSON.stringify({
+            ...stored,
+            desktop: { mode: 'store', available: true, receiverDrivable: true },
+        })
+    );
+    for (const flags of [{}, { userAway: true }, { allowForeground: true }])
+        assert.ok(
+            readProbe(outDir, log, { ...asked, ...flags }),
+            JSON.stringify(flags)
+        );
+});
+
 test('probe P3 on a checkpoint is unknown, never "the forcer did not take"', () => {
     assert.deepEqual(browserRelayRecord({ ok: true }), { ok: true, detail: null });
     assert.deepEqual(browserRelayRecord({ ok: false, detail: 'pair was host' }), {
@@ -2282,4 +2704,309 @@ test('the floe.one row names a challenge and stays not ok', () => {
         headers: { 'x-vercel-mitigated': 'deny' },
     });
     assert.equal(odd.detail, '403 via www.floe.one, etag none');
+});
+
+test('a run or probe with --no-idle-check says so in its second line, and only then', () => {
+    assert.equal(idleCheckLine({}), null);
+    assert.equal(idleCheckLine({ userAway: true }), null);
+    const line = idleCheckLine({ userAway: true, noIdleCheck: true });
+    assert.match(line, /^desktop: the input idle check is OFF \(--no-idle-check\)/);
+    assert.match(line, /keys typed then can land in it/);
+    // It never hides the not-driven line: the two cannot both apply.
+    assert.equal(foregroundLine({ desktop: 'store', userAway: true, noIdleCheck: true }), null);
+});
+
+// Second review of #542, finding A: one command runs one cell, and the guard
+// that knows desktop.json is edited lives in the process that edited it. A
+// command killed after the edit left the file changed; the next command's
+// guard then backed that file up as the owner's and "restored" it, identical
+// and wrong.
+test('a run or probe refuses to start while an earlier run under --out left desktop.json edited, and cleanup clears it', async () => {
+    const outDir = out('unrestored-desktop');
+    const runId = '20260106-000000-shipped-quick';
+    const runDir = path.join(outDir, runId);
+    mkdirSync(runDir, { recursive: true });
+    const bak = path.join(runDir, 'desktop.json.bak');
+    writeFileSync(bak, '{"reportStats":true}\n');
+    const cfg = path.join(base, 'appdata', 'floe', 'desktop.json');
+    const manifestFile = path.join(runDir, 'manifest.json');
+    const write = (desktop) =>
+        writeFileSync(
+            manifestFile,
+            JSON.stringify({
+                runId,
+                binDir: path.join(outDir, 'bin'),
+                pids: [],
+                desktop,
+                stack: { started: false },
+                fixtureDirs: [],
+                appDataRedirect: null,
+            })
+        );
+    const edited = { backup: bak, configPath: cfg, sha256: 'x', restored: null };
+
+    // The pure reading first: only an edit with no restore on record counts.
+    write({ backup: null, configPath: null, sha256: null, restored: null });
+    assert.deepEqual(unrestoredDesktopRuns(outDir), []);
+    write({ ...edited, restored: true });
+    assert.deepEqual(unrestoredDesktopRuns(outDir), []);
+    for (const restored of [null, false, undefined, 'true']) {
+        write({ ...edited, restored });
+        assert.deepEqual(unrestoredDesktopRuns(outDir), [{ runId, backup: bak }], String(restored));
+    }
+    write(edited);
+    // A folder with no manifest, or one that is not JSON, is not a run.
+    mkdirSync(path.join(outDir, 'bin'), { recursive: true });
+    mkdirSync(path.join(outDir, 'junk'), { recursive: true });
+    writeFileSync(path.join(outDir, 'junk', 'manifest.json'), '{ not json');
+    assert.deepEqual(unrestoredDesktopRuns(outDir), [{ runId, backup: bak }]);
+    assert.deepEqual(unrestoredDesktopRuns(path.join(outDir, 'nowhere')), []);
+    for (const desktop of ['none', 'wailsdev'])
+        assert.equal(unrestoredDesktopLine({ out: outDir, desktop }), null, desktop);
+    for (const desktop of ['auto', 'store', 'portable'])
+        assert.match(unrestoredDesktopLine({ out: outDir, desktop }), /cleanup --run 20260106-000000-shipped-quick/, desktop);
+
+    // run and probe: exit 3 before anything is created or launched.
+    const before = readdirSync(outDir).sort();
+    for (const cmd of ['run', 'probe']) {
+        const i = io(fakeWorld());
+        const code = await main(
+            [cmd, '--quick', '--allow-foreground', '--root', root, '--out', outDir].filter((a) => cmd === 'run' || a !== '--quick'),
+            { ...i, cellHook: shrink }
+        );
+        assert.equal(code, 3, `${cmd}: ${i.errors.join('\n')}`);
+        assert.ok(
+            i.errors.some((l) => /edited the real desktop\.json and its manifest does not say the file was put back/.test(l)),
+            i.errors.join('\n')
+        );
+        assert.equal(i.lines.filter((l) => l.startsWith('PROGRESS ')).length, 0);
+        assert.deepEqual(readdirSync(outDir).sort(), before, `${cmd} created nothing`);
+    }
+    // A run with no desktop side has nothing to do with the file.
+    const web = io(fakeWorld());
+    const webCode = await main(
+        ['run', '--quick', '--desktop', 'none', '--root', root, '--out', outDir],
+        { ...web, cellHook: shrink }
+    );
+    assert.notEqual(webCode, 3, web.errors.join('\n'));
+
+    // cleanup that could not restore leaves the refusal standing.
+    const refusing = io(fakeWorld(), {
+        tryAdapter: async (name) =>
+            name === 'desktop'
+                ? { restoreConfig: async () => ({ ok: false, written: false, detail: 'backup missing (fake)' }) }
+                : null,
+    });
+    assert.equal(await main(['cleanup', '--run', runId, '--keep', '--root', root, '--out', outDir], refusing), 1);
+    assert.equal(JSON.parse(readFileSync(manifestFile, 'utf8')).desktop.restored, null);
+    assert.equal(unrestoredDesktopRuns(outDir).length, 1);
+
+    // cleanup that restored says so in the manifest, and the next run starts.
+    const restoring = io(fakeWorld(), {
+        tryAdapter: async (name) =>
+            name === 'desktop'
+                ? { restoreConfig: async () => ({ ok: true, written: true, detail: 'restored (fake)' }) }
+                : null,
+    });
+    assert.equal(
+        await main(['cleanup', '--run', runId, '--keep', '--root', root, '--out', outDir], restoring),
+        0,
+        restoring.errors.join('\n')
+    );
+    if (existsSync(manifestFile)) {
+        const m = JSON.parse(readFileSync(manifestFile, 'utf8'));
+        assert.equal(m.desktop.restored, true);
+        assert.equal(m.desktop.restoredBy, 'cleanup');
+    }
+    assert.deepEqual(unrestoredDesktopRuns(outDir), []);
+    assert.equal(unrestoredDesktopLine({ out: outDir, desktop: 'store' }), null);
+});
+
+// Second review of #542, finding F. What the Safety table says about a built
+// app comes from objects the run hands every leg through `shared`, and the
+// second line of a --no-idle-check run from one call in run and one in
+// probe. Each was right by reading and pinned by nothing: with the wiring
+// removed, every test still passed. This one runs `run` and `probe`.
+test('run hands every desktop leg the records the Safety table reads, and says --no-idle-check in its second line and in the table', async () => {
+    const world = fakeWorld();
+    const outDir = out('shared-wiring');
+    const base0 = io(world);
+    const seen = [];
+    const withCapture = {
+        ...base0,
+        getAdapter: async (name) => {
+            const adapter = await base0.getAdapter(name);
+            if (name !== 'desktop') return adapter;
+            return {
+                ...adapter,
+                createLeg: (opts) => {
+                    seen.push(opts.shared);
+                    // What a real leg and its driver do with them.
+                    opts.shared.desktopCalls.exe += 3;
+                    opts.shared.desktopLegs.launched += 1;
+                    opts.shared.desktopLegs.stopped += 1;
+                    return adapter.createLeg(opts);
+                },
+            };
+        },
+    };
+    const code = await main(
+        ['run', '--quick', '--desktop', 'portable', '--user-away', '--no-idle-check', '--root', root, '--out', outDir],
+        { ...withCapture, cellHook: shrink }
+    );
+    assert.equal(code, 0, base0.errors.join('\n'));
+    assert.equal(base0.lines[0], 'profile: shipped (default)');
+    assert.match(base0.lines[1], /--no-idle-check/);
+    assert.equal(base0.lines[1], idleCheckLine({ userAway: true, noIdleCheck: true, desktop: 'portable' }));
+
+    assert.ok(seen.length >= 2, `${seen.length} desktop legs were made`);
+    for (const shared of seen) {
+        assert.equal(shared, seen[0], 'one shared object for the whole run');
+        assert.deepEqual(Object.keys(shared.desktopLegs).sort(), ['launched', 'problems', 'stopped']);
+        assert.equal(typeof shared.desktopCalls.exe, 'number');
+        // The owner's values are kept under this run's --out, nowhere else.
+        assert.equal(shared.ownerState.file, path.join(outDir, 'owner-state.json'));
+    }
+
+    const runs = readdirSync(outDir).filter((n) => existsSync(path.join(outDir, n, 'audit.md')));
+    assert.equal(runs.length, 1);
+    const md = readFileSync(path.join(outDir, runs[0], 'audit.md'), 'utf8');
+    const safety = md.split('## Safety')[1].split('## Failures')[0];
+    // The value cell of a Safety row, without the table's padding.
+    const valueIn = (section, label) => {
+        const line = section.split('\n').find((l) => l.includes(label));
+        assert.ok(line, `no Safety row "${label}"`);
+        return line.split('|')[2].trim();
+    };
+    const cell = (label) => valueIn(safety, label);
+    // The same objects the table reads: what the legs wrote is what it says.
+    assert.equal(cell('window activations'), String(seen.length * 3));
+    assert.ok(
+        cell('desktop app put back as found').startsWith(`yes (${seen.length} of ${seen.length} launched app(s) closed by themselves`),
+        cell('desktop app put back as found')
+    );
+    assert.ok(cell('input idle check before desktop calls').startsWith('OFF (--no-idle-check'), cell('input idle check'));
+
+    // Without the flag the line is not printed and the row reads on.
+    const plainWorld = fakeWorld();
+    const plain = io(plainWorld);
+    const plainOut = out('shared-wiring-plain');
+    assert.equal(
+        await main(['run', '--quick', '--desktop', 'portable', '--user-away', '--root', root, '--out', plainOut], {
+            ...plain,
+            cellHook: shrink,
+        }),
+        0,
+        plain.errors.join('\n')
+    );
+    assert.equal(plain.lines.some((l) => /--no-idle-check/.test(l)), false);
+    const plainRun = readdirSync(plainOut).filter((n) => existsSync(path.join(plainOut, n, 'audit.md')));
+    const plainMd = readFileSync(path.join(plainOut, plainRun[0], 'audit.md'), 'utf8');
+    const plainSafety = plainMd.split('## Safety')[1].split('## Failures')[0];
+    assert.equal(valueIn(plainSafety, 'input idle check before desktop calls'), 'on');
+    // No built app was really launched by the fakes: the row says so.
+    assert.equal(valueIn(plainSafety, 'desktop app put back as found'), 'n/a (no built app was launched)');
+    assert.equal(valueIn(plainSafety, 'window activations'), '0');
+
+    // probe prints the same second line.
+    const probing = io(fakeWorld());
+    await main(['probe', '--desktop', 'portable', '--user-away', '--no-idle-check', '--root', root, '--out', out('shared-wiring-probe')], probing);
+    assert.match(probing.lines[1], /--no-idle-check/);
+});
+
+// Third review of #542, finding 1. The desktop probes launch the Store app
+// behind the same guard a run uses, and they are the first and longest
+// command of a session. A probe killed between an edit and its restore left
+// nothing the start check could read, because only a run had a manifest.
+test('the desktop probes get a manifest of their own, which the start check reads and cleanup replays', async () => {
+    const outDir = out('probe-manifest');
+    let handed = null;
+    const base0 = io(fakeWorld());
+    const probing = {
+        ...base0,
+        getAdapter: async (name) => {
+            const adapter = await base0.getAdapter(name);
+            if (name !== 'desktop') return adapter;
+            return {
+                ...adapter,
+                probe: async (o) => {
+                    handed = o;
+                    return adapter.probe(o);
+                },
+            };
+        },
+        tryAdapter: async (name) => probing.getAdapter(name),
+    };
+    await main(['probe', '--desktop', 'portable', '--allow-foreground', '--root', root, '--out', outDir], probing);
+    assert.ok(handed, 'the desktop probe ran');
+    const shared = handed.shared;
+    assert.equal(shared.manifest.runId, PROBE_RUN);
+    assert.equal(shared.manifest.binDir, null, 'nothing for cleanup to delete');
+    assert.deepEqual(shared.manifest.fixtureDirs, []);
+    assert.equal(shared.ownerState.file, path.join(outDir, 'owner-state.json'));
+
+    // What a leg does when its guard edits desktop.json (recordGuard), and
+    // then the process dies before the restore.
+    const bak = path.join(outDir, 'probe', 'p9', 'desktop.json.bak');
+    mkdirSync(path.dirname(bak), { recursive: true });
+    writeFileSync(bak, '{"reportStats":true}\n');
+    shared.manifest.desktop = {
+        backup: bak,
+        configPath: path.join(base, 'appdata', 'floe', 'desktop.json'),
+        sha256: 'x',
+        restored: null,
+    };
+    shared.writeManifest();
+    const file = path.join(outDir, PROBE_RUN, 'manifest.json');
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).desktop.backup, bak);
+
+    // The next command sees it and names the cleanup.
+    assert.deepEqual(unrestoredDesktopRuns(outDir), [{ runId: PROBE_RUN, backup: bak }]);
+    assert.match(unrestoredDesktopLine({ out: outDir, desktop: 'store' }), /cleanup --run probe --out /);
+    const refused = io(fakeWorld());
+    assert.equal(
+        await main(['run', '--quick', '--allow-foreground', '--root', root, '--out', outDir], { ...refused, cellHook: shrink }),
+        3
+    );
+
+    // A bare cleanup still means the newest RUN: the probes' folder sorts
+    // after every run id and is not one.
+    const runId = '20260107-000000-shipped-quick';
+    mkdirSync(path.join(outDir, runId), { recursive: true });
+    writeFileSync(
+        path.join(outDir, runId, 'manifest.json'),
+        JSON.stringify({
+            runId,
+            binDir: null,
+            pids: [],
+            desktop: { backup: null, configPath: null, sha256: null, restored: null },
+            stack: { started: false },
+            fixtureDirs: [],
+            appDataRedirect: null,
+        })
+    );
+    const seen = [];
+    const restoring = () =>
+        io(fakeWorld(), {
+            tryAdapter: async (name) =>
+                name === 'desktop'
+                    ? {
+                          restoreConfig: async (rec) => {
+                              seen.push(rec.backup);
+                              return { ok: true, written: true, detail: 'restored (fake)' };
+                          },
+                      }
+                    : null,
+        });
+    assert.equal(await main(['cleanup', '--keep', '--root', root, '--out', outDir], restoring()), 0);
+    assert.deepEqual(seen, [], 'the newest run had no edit, and the probe folder was not taken for it');
+    assert.equal(unrestoredDesktopRuns(outDir).length, 1);
+
+    // cleanup --run probe replays the backup, records it, and deletes nothing.
+    const done = restoring();
+    assert.equal(await main(['cleanup', '--run', PROBE_RUN, '--keep', '--root', root, '--out', outDir], done), 0, done.errors.join('\n'));
+    assert.deepEqual(seen, [bak]);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).desktop.restored, true);
+    assert.ok(existsSync(bak), 'the probe evidence is kept');
+    assert.deepEqual(unrestoredDesktopRuns(outDir), []);
 });

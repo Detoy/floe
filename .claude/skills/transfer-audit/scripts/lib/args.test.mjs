@@ -240,3 +240,79 @@ test('--monitor takes secondary, primary, off or an index, and defaults to secon
         /--keep-data/
     );
 });
+
+// The owner at the PC: on an exe lane the desktop is driven only when the run
+// says nobody is there (--user-away) or accepts the focus change
+// (--allow-foreground). The second is never implied by anything else. Both
+// together are allowed: --user-away keeps its idle check, so the pair plans
+// and behaves exactly as --user-away alone.
+test('--allow-foreground is its own flag on run and probe: off by default, never implied by --user-away, and allowed beside it', () => {
+    for (const cmd of ['run', 'probe']) {
+        const none = parse([cmd]).opts;
+        assert.deepEqual([none.userAway, none.allowForeground], [false, false]);
+        const allowed = parse([cmd, '--allow-foreground']).opts;
+        assert.deepEqual(
+            [allowed.userAway, allowed.allowForeground],
+            [false, true]
+        );
+        const away = parse([cmd, '--user-away']).opts;
+        assert.deepEqual([away.userAway, away.allowForeground], [true, false]);
+        const both = parse([cmd, '--user-away', '--allow-foreground']).opts;
+        assert.deepEqual([both.userAway, both.allowForeground], [true, true]);
+        assert.throws(
+            () => parse([cmd, '--allow-foreground', '--allow-foreground']),
+            /given twice/
+        );
+    }
+    for (const cmd of ['versions', 'cleanup'])
+        assert.throws(
+            () => parse([cmd, '--allow-foreground']),
+            (e) =>
+                e instanceof UsageError &&
+                /--allow-foreground does not apply to/.test(e.message)
+        );
+    assert.deepEqual(FLAGS['--allow-foreground'], {
+        value: false,
+        cmds: ['run', 'probe'],
+    });
+    // No other flag sets it.
+    const everything = parse([
+        'run',
+        '--profile',
+        'head',
+        '--deep',
+        '--desktop',
+        'store',
+        '--pin',
+        '--strict',
+        '--pion-trace',
+        '--user-away',
+        '--keep',
+        '--keep-data',
+        '--relaxed',
+        '--caddy',
+        '--monitor',
+        'primary',
+    ]).opts;
+    assert.equal(everything.allowForeground, false);
+    // The usage text carries the flag on both lines and the rule in a sentence.
+    assert.equal((USAGE.match(/\[--allow-foreground\]/g) || []).length, 2);
+    assert.match(USAGE, /On an exe lane[^]*--user-away[^]*--allow-foreground/);
+});
+
+test('--no-idle-check only goes with --user-away, on run and probe, and is off by default', () => {
+    for (const cmd of ['run', 'probe']) {
+        assert.equal(parse([cmd]).opts.noIdleCheck, false);
+        assert.equal(parse([cmd, '--user-away']).opts.noIdleCheck, false);
+        const off = parse([cmd, '--user-away', '--no-idle-check']).opts;
+        assert.deepEqual([off.userAway, off.noIdleCheck], [true, true]);
+        // Alone, or beside the other flag only, it has nothing to turn off.
+        assert.throws(() => parse([cmd, '--no-idle-check']), /only goes with --user-away/);
+        assert.throws(
+            () => parse([cmd, '--allow-foreground', '--no-idle-check']),
+            /only goes with --user-away/
+        );
+    }
+    assert.throws(() => parse(['versions', '--no-idle-check']));
+    assert.match(USAGE, /--no-idle-check goes with --user-away/);
+});

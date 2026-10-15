@@ -226,7 +226,7 @@ The default configuration has no [relay](/glossary#relay) and works on many netw
 add a [TURN](/glossary#turn) relay. In the Floe-Server template, turn on **Advanced View** and fill
 in **Cloudflare TURN Key ID** and **Cloudflare TURN API Token** with a Cloudflare Realtime TURN key.
 You can also run coturn separately and fill in **Self-hosted TURN Domain** and **Self-hosted TURN
-Secret** instead. See [TURN relay](/self-hosting/turn-relay).
+Secret** instead. If that coturn has no TLS certificate, set **Self-hosted TURN TLS** to `off`. See [TURN relay](/self-hosting/turn-relay).
 
 ## Request links on Unraid {#request-links}
 
@@ -273,7 +273,7 @@ there is no appdata directory to migrate. The one thing to keep is the policy
 folder, if you added one for request links.
 
 To pin a version, change the tag at the end of each template's **Repository** field, for example
-`ghcr.io/jannskiee/floe-server:latest` to `ghcr.io/jannskiee/floe-server:1.11.0`. Change both
+`ghcr.io/jannskiee/floe-server:latest` to `ghcr.io/jannskiee/floe-server:1.11.1`. Change both
 templates to the same version, because the client and the server should match. The tags you can
 use are in [Container images](/self-hosting/images#tags).
 

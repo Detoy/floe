@@ -16,7 +16,8 @@ From the repo root:
 `all` is the default; a single check name runs only that check; `--root` points it at
 another checkout (default: the repo the script lives in). `links` also runs the footer
 mirror, the image and snippet paths and the client `/docs` paths. The last five names are
-the report-only checks, which have a section of their own below.
+the checks that started report-only, which have a section of their own below; three of
+them (`pagestandard`, `messages`, `captures`) are hard since 2026-10-15.
 
 CI runs `docs-check.mjs all` on every PR: it is the `Docs pre-flight` step of the
 `Repo guardrails` job, which the `CI green` gate needs, so a HARD line blocks the merge.
@@ -33,7 +34,10 @@ cell or closes one after punctuation, an em or en dash (in the docs, the root
 and unraid Markdown, the desktop READMEs, `.goreleaser.yml` and `docs/style.css`), a
 documented server default that contradicts server/server.js, or one
 of the env self-checks failing (fewer keys than the server modules read, or a configuration
-page that yields no variable rows). Fix, rerun. Exit 2 is a usage error or a root with no
+page that yields no variable rows). And from the three promoted checks: a break of the page
+standard, a message row whose words left its file or whose anchor is gone, a line of a copy
+module with no row, docs/messages.mdx differing from the rows, and a picture's recorded
+string that left its sources. Fix, rerun. Exit 2 is a usage error or a root with no
 docs/docs.json. Exit 0 with NOTE lines is the normal outcome. Read every NOTE and decide;
 do not skim.
 
@@ -109,9 +113,12 @@ Run the script itself for that.
 
 ### The report-only checks
 
-Five checks print NOTE lines and cannot fail a run today, because the docs have not been
-cleared of what they measure. In an `all` run each prints its first 15 notes and one line
-saying how many it kept back; run one alone to see them all:
+Five checks were written to print NOTE lines only, because on the day each was written the
+docs had not been cleared of what it measures. `pagestandard`, `messages` and `captures`
+were cleared and made hard on 2026-10-15: what they print now fails the run. `readability`
+and `glossary` still report, because whether a long sentence or an unlinked term is wrong
+is a reader's call. In an `all` run a reporting check prints its first 15 notes and one
+line saying how many it kept back; run one alone to see them all:
 
     node .claude/skills/docs-verify/scripts/docs-check.mjs readability
 
@@ -129,7 +136,9 @@ saying how many it kept back; run one alone to see them all:
   `sidebarTitle`, `description` or `keywords`; a description over 160 characters; a page
   that starts on a heading or a table; a troubleshooting H3 with no `{#id}`; a heading with
   nothing under it; two callouts under one H2 or one straight after another; a code fence
-  with no language; a raw lower-case `<word>` outside code; a message table not headed
+  with no language; a bare lower-case `<word>` outside code that is not closed on its line
+  (the shape of a placeholder typed raw; an element with attributes, such as
+  `<video controls src=...>`, or one closed on its line is fine); a message table not headed
   `Message | What it means | What to do`; and the standard's word list (`afterwards`,
   `e.g.`, `host name`, a spelled-out number with a unit). The changelog is exempt. Each
   line starts with the kind of finding (`callout:`, `frontmatter:`, `opening:`), so the
@@ -146,21 +155,43 @@ saying how many it kept back; run one alone to see them all:
   `text` (with `{name}` where the app fills something in), `source` (the file that types
   it), `anchor` (the docs heading that explains it, or null) and `why_no_home` (why a row
   with no anchor needs none: a button label, a heading that repeats the sentence under
-  it). A NOTE is a row whose text has left its source, a row whose anchor does not exist,
-  and docs/messages.mdx differing from what the generator prints; rows with no anchor and
-  no reason are counted in one line. A web, site or server row is read from the working
-  tree. A cli or desktop row is held to references/released-strings.json instead, because
-  the docs describe the released apps and main runs ahead of them.
+  it). It fails on a row whose text has left its source, a row whose anchor does not
+  exist, docs/messages.mdx differing from what the generator prints, and a copy line with
+  no row (below). Rows with no anchor and no reason fail nothing: the index lists them as
+  Not explained yet, and the closing info line counts them. A web, site or server row, and
+  a cli row typed in client/public (the install scripts, which floe.one serves from main),
+  is read from the working tree. Any other cli or desktop row is held to
+  references/released-strings.json instead, because the docs describe the released apps
+  and main runs ahead of them. Renaming a heading or a sidebarTitle that a row links to
+  changes docs/messages.mdx too, so run `messages-index.mjs --write` in that PR. A text is
+  found whole, as a template where its placeholders
+  sit in one literal (`Peer version: %s`, `` `${size} in ${time}.` ``), or by its longer
+  fragments when it is put together from several (message-match.mjs says how).
+- The copy modules: `client/lib/request/visitorCopy.ts`, `desktop/frontend/src/requestCopy.ts`
+  and `cli/cmd/floe/sendto.go` hold every sentence a request link shows (`COPY_FILES` in
+  message-match.mjs), so every copy line in them needs a row of that file: with an anchor,
+  or with a `why_no_home` for a line that is not a message (a month abbreviation, a
+  fragment of a longer line). A line is covered when it sits in a row's text, placeholders
+  matched by position whatever their names, so a row that joins a title and its body covers
+  both, and a one-word line inside a longer row (a button such as Cancel inside "Cancel
+  drop") counts as covered too, so give such a line a row of its own. Paths and module
+  specifiers, codes such as `relay-cap`, constant names, directives, locale tags and
+  format strings with no word are not copy. The request page's module is read from the
+  working tree: a sentence added to `visitorCopy.ts` gets its row in the same PR. The
+  desktop and CLI modules are held to the lines the snapshot recorded at their tags, so a
+  sentence added to `requestCopy.ts` or `sendto.go` gets its row at release prep, when the
+  snapshot is written at the new tags and records the line.
 - `captures`: each `shots` entry of docs/images/\*/capture-manifest.json may record
   `strings` (the UI texts that can be read in the picture) and `sources` (the files that
-  type them). A string that has left all of its sources is a NOTE, the web pictures read
-  from the working tree and the desktop ones from the snapshot. Shots that record nothing
-  are one line per manifest.
+  type them). A string that has left all of its sources fails the run, the web pictures
+  read from the working tree and the desktop ones from the snapshot, and so does a shot
+  that records nothing (one line per manifest).
 
 Promoting one: each has a single constant at the top of its section in docs-check.mjs
 (`READABILITY_HARD`, `PAGESTANDARD_HARD`, `GLOSSARY_HARD`, `MESSAGES_HARD`,
 `CAPTURES_HARD`). Set it to `true` in the PR that clears the docs of everything the check
 reports, and each line it prints becomes HARD. Not sooner: CI runs `all` on every PR.
+Three are `true` since 2026-10-15.
 
 The files behind `messages`, and when each is written:
 
@@ -172,8 +203,14 @@ The files behind `messages`, and when each is written:
   match to two lists for a person to decide.
 - references/released-strings.json is written by
   `node .claude/skills/docs-verify/scripts/released-strings.mjs --cli <v* tag> --desktop <desktop-v* tag>`,
-  at release prep and at no other time: between releases it is meant to stay behind main.
-  It reads the two tags with `git show` and lists what is not at its tag.
+  at release prep, with the new tags. Between releases it stays behind main: run it again
+  only at the SAME two tags (its `refs` name them), and do so whenever a cli or desktop
+  row, or a desktop picture string, is added or edited, because the file lists only the
+  strings that were rows when it was written; the HARD line names the command. It reads
+  the two tags with `git show` and lists what is not at its tag. Under `copy` it records
+  the copy lines of the desktop and CLI copy modules at their tags, and under
+  `copyScanner` the version of the scanner that read them: a change to the scanner fails a
+  repository test until the file is written again at the same tags.
 - docs/messages.mdx is printed by `scripts/messages-index.mjs` (`--write` to write it).
   Never edit the page by hand: change the row and write it again.
 

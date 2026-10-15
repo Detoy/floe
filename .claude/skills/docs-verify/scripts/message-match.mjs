@@ -13,14 +13,24 @@
  * reader sees a quote. `haystack` undoes exactly those, so the text a person
  * reads on screen can be looked up as typed.
  *
+ * Why a template match: most messages with a changing part are one literal
+ * with a format verb or an interpolation where the row has a placeholder
+ * (`Peer version: %s` is the row "Peer version: {version}"). `findTemplate`
+ * finds those whole, the static parts typed exactly and each placeholder
+ * standing for any one source placeholder. Without it, a message whose static
+ * words are short could only be matched by the fragment rule below, and it
+ * reported "Peer version: {version}" and "{size} in {duration}." gone.
+ *
  * Why a threshold and not "every part": a message is often built in two files
  * (Go wraps an error as `could not resolve %q: %w` in one and words the cause
  * in another), and a row names one source. So a text that is not found whole
  * passes when two of its static parts of FRAGMENT_PAIR characters or one of
- * FRAGMENT_SINGLE are in the file. That is loose on purpose: the checks that
- * use it only print notes, and a rule that needed every part would report
- * every wrapped error in the CLI.
+ * FRAGMENT_SINGLE are in the file. That is loose on purpose: a rule that
+ * needed every part would report every wrapped error in the CLI. The cost of
+ * loose is a stale row that passes, never a check that fails on a row that is
+ * right, which matters since the `messages` and `captures` checks are hard.
  */
+import { createHash } from 'node:crypto';
 
 // A variable part of a message, as messages.json writes it: {name}, {n},
 // {your path}. A letter must follow the brace, so the JSON bodies the server
@@ -53,6 +63,9 @@ const SIMPLE_ESCAPES = {
     "'": "'",
     '`': '`',
     '\\': '\\',
+    // A dollar sign typed as one in a template literal or a shell string:
+    // install.sh prints `\${HOME}` so the reader sees ${HOME}.
+    $: '$',
 };
 
 // Typed and straight quotes are one character each, so folding keeps every
@@ -152,12 +165,293 @@ export function staticFragments(text) {
         .filter((part) => /[A-Za-z0-9]/.test(part));
 }
 
+// What can stand for a changing part inside a source literal, one at a time:
+// a Go or C format verb (%s, %d, %q, %w, %.1f, %-8s), an interpolation
+// (${name} in a template literal or a shell string, ${f(x)} included), a
+// shell variable ($NAME), or a placeholder spelled the way a row spells one.
+const SOURCE_PLACEHOLDER = [
+    '%[-+# 0]*\\d*(?:\\.\\d+)?[a-zA-Z]',
+    '\\$\\{[^}]{1,80}\\}',
+    '\\$[A-Za-z_][A-Za-z0-9_]*',
+    '\\{[A-Za-z][A-Za-z0-9 _.-]{0,30}\\}',
+].join('|');
+
+/**
+ * Where a text with placeholders starts in the haystack as one literal, or
+ * -1: the static parts typed exactly and side by side, each placeholder of the
+ * text standing for one source placeholder. A text with no placeholder, or
+ * with no letter or digit outside them ("{cause}"), is never matched here, so
+ * a row cannot pass on format verbs alone. The word rule of findText applies.
+ */
+export function findTemplate(hay, text) {
+    const n = fold(squeeze(text));
+    const parts = n.split(new RegExp(PLACEHOLDER.source, 'g'));
+    if (parts.length < 2 || !/[A-Za-z0-9]/.test(parts.join(''))) return -1;
+    const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const wordy = /[A-Za-z0-9]/;
+    const head = wordy.test(n[0]) ? '(?<![A-Za-z0-9])' : '';
+    const tail = wordy.test(n[n.length - 1]) ? '(?![A-Za-z0-9])' : '';
+    const body = parts.map(escape).join(`(?:${SOURCE_PLACEHOLDER})`);
+    const m = new RegExp(head + body + tail).exec(hay.folded);
+    return m ? m.index : -1;
+}
+
 /** Whether a message's text is still typed in this source. */
 export function textOccurs(text, hay) {
-    if (findText(hay, text) >= 0) return true;
+    if (findText(hay, text) >= 0 || findTemplate(hay, text) >= 0) return true;
     const found = staticFragments(text).filter((f) => findText(hay, f) >= 0);
     return (
         found.filter((f) => f.length >= FRAGMENT_PAIR).length >= 2 ||
         found.some((f) => f.length >= FRAGMENT_SINGLE)
     );
+}
+
+// ---------------------------------------------------------------------------
+// The copy modules
+// ---------------------------------------------------------------------------
+
+// The three files that hold every sentence a request link shows, one per
+// surface (CLAUDE.md: every sentence either side shows is fixed copy chosen
+// by a code). Unlike the rest of the source, all of a copy module is meant to
+// be seen, so every copy line in it must have a row in messages.json: one that
+// says where it is explained, or why it is not listed.
+export const COPY_FILES = [
+    { surface: 'web-request', file: 'client/lib/request/visitorCopy.ts' },
+    { surface: 'desktop', file: 'desktop/frontend/src/requestCopy.ts' },
+    { surface: 'cli', file: 'cli/cmd/floe/sendto.go' },
+];
+
+// A Go format verb, an argument index included (%[1]s). `%%` is a percent
+// sign, so it is set aside before this runs.
+const GO_VERB = /%[-+# 0]*(?:\[\d+\])?\d*(?:\.\d+)?(?:\[\d+\])?[a-zA-Z]/g;
+
+// Words after which a slash starts a regular expression, not a division.
+const REGEX_AFTER = new Set([
+    'return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void',
+    'throw', 'case', 'do', 'else', 'yield', 'await',
+]);
+
+// The escape at s[i] (a backslash) as the reader sees it, and where the
+// source goes on: the same rule haystack applies, so a line typed with
+// ’ is the line a row writes with a typographic apostrophe. Go's
+// \U00000000 is read too.
+function unescape(s, i) {
+    const m = /^\\(u\{[0-9a-fA-F]+\}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|x[0-9a-fA-F]{2}|[\s\S])/.exec(
+        s.slice(i, i + 12)
+    );
+    if (!m) return ['', i + 1];
+    const e = m[1];
+    let t;
+    if (e in SIMPLE_ESCAPES) t = SIMPLE_ESCAPES[e];
+    else if (e.length === 1) t = e;
+    else t = String.fromCodePoint(parseInt(e.replace(/^[uUx]\{?|\}$/g, ''), 16));
+    return [t, i + m[0].length];
+}
+
+/**
+ * Every string literal of a TypeScript or Go file, in source order, as the
+ * reader would see it: escapes decoded, each `${...}` of a template literal
+ * and each format verb written {}, white space squeezed. Comments are
+ * skipped, a template literal inside an interpolation is a literal of its
+ * own, and a TypeScript regular expression is not read as a string. In Go
+ * (`go` true) a backtick string is raw: no escape and no interpolation.
+ */
+export function stringLiterals(source, go = false) {
+    const s = source.replace(/\r\n/g, '\n');
+    const out = [];
+    // Format verbs only in Go: "100% done" in TypeScript is not "100{}one".
+    const emit = (t) =>
+        out.push(
+            squeeze(
+                go
+                    ? t
+                          .replace(/%%/g, '\u0000')
+                          .replace(GO_VERB, '{}')
+                          .replace(/\u0000/g, '%')
+                    : t
+            )
+        );
+    // A module specifier (`from '...'`, `import '...'`, `require('...')`)
+    // names a file, never something a person reads.
+    const specifier = () =>
+        /(?:\bfrom|\bimport|\b(?:require|import)\s*\()\s*$/.test(
+            s.slice(Math.max(0, i - 24), i)
+        );
+    let i = 0;
+    // What came last in the code, to tell a regular expression from a
+    // division: a slash after one of these punctuation marks, or after a
+    // word in REGEX_AFTER, starts a regular expression.
+    let prev = '(';
+    const quoted = (q) => {
+        let t = '';
+        for (i++; i < s.length && s[i] !== q && s[i] !== '\n'; ) {
+            if (s[i] === '\\') {
+                const [e, next] = unescape(s, i);
+                t += e;
+                i = next;
+            } else t += s[i++];
+        }
+        i++;
+        return t;
+    };
+    // Code until the } that closes an interpolation, or to the end.
+    const code = (inside) => {
+        let depth = 0;
+        while (i < s.length) {
+            const c = s[i];
+            const d = s[i + 1];
+            if (c === '/' && d === '/') {
+                while (i < s.length && s[i] !== '\n') i++;
+            } else if (c === '/' && d === '*') {
+                const end = s.indexOf('*/', i + 2);
+                i = end < 0 ? s.length : end + 2;
+            } else if (c === '"' || c === "'") {
+                const named = !go && specifier();
+                const t = quoted(c);
+                if (!named) emit(t);
+                prev = 'x';
+            } else if (c === '`') {
+                const t = template();
+                // A Go struct tag, `json:"name"`, is metadata.
+                if (!(go && /^(\w+:"[^"]*"\s*)+$/.test(t))) emit(t);
+                prev = 'x';
+            } else if (/[A-Za-z_$]/.test(c)) {
+                // A word: a keyword in REGEX_AFTER lets a slash start a
+                // regular expression, any other name or number divides.
+                let j = i + 1;
+                while (j < s.length && /[\w$]/.test(s[j])) j++;
+                prev = REGEX_AFTER.has(s.slice(i, j)) ? '(' : 'x';
+                i = j;
+            } else if (
+                !go &&
+                c === '/' &&
+                /[(,=:[!&|?{};+\-*%<>~^]/.test(prev)
+            ) {
+                // A regular expression literal, classes included.
+                let cls = false;
+                for (i++; i < s.length && s[i] !== '\n'; i++) {
+                    if (s[i] === '\\') i++;
+                    else if (s[i] === '[') cls = true;
+                    else if (s[i] === ']') cls = false;
+                    else if (s[i] === '/' && !cls) break;
+                }
+                i++;
+                prev = 'x';
+            } else {
+                if (c === '{') depth++;
+                if (c === '}') {
+                    if (inside && depth === 0) {
+                        i++;
+                        return;
+                    }
+                    depth--;
+                }
+                if (!/\s/.test(c)) prev = c;
+                i++;
+            }
+        }
+    };
+    // A template literal, or in Go a raw string.
+    const template = () => {
+        let t = '';
+        for (i++; i < s.length && s[i] !== '`'; ) {
+            if (go) t += s[i++];
+            else if (s[i] === '\\') {
+                const [e, next] = unescape(s, i);
+                t += e;
+                i = next;
+            } else if (s[i] === '$' && s[i + 1] === '{') {
+                t += '{}';
+                i += 2;
+                code(true);
+            } else t += s[i++];
+        }
+        i++;
+        return t;
+    };
+    code(false);
+    return out;
+}
+
+/**
+ * The literals of a copy module that are copy: words a person reads, as
+ * against a path (an import, a Go package), a code (`relay-cap`), a
+ * constant's name, a directive ('use client'), a locale tag ('en-US'), or a
+ * format string with no word in it. Deduplicated, in source order.
+ */
+export function copyLines(source, file) {
+    const seen = new Set();
+    // No space and a slash, and shaped like a path: it starts at a root or
+    // an alias, its first part has a dot (a host), or it has two slashes.
+    // "N/A" is still copy.
+    const path = (t) =>
+        !/\s/.test(t) &&
+        t.includes('/') &&
+        (/^[@.~/]/.test(t) || /^[^/]*\./.test(t) || /\/.*\//.test(t));
+    return stringLiterals(source, file.endsWith('.go')).filter((t) => {
+        const copy =
+            /[A-Za-z]{2}/.test(t.replace(/\{\}/g, '')) &&
+            !/^[a-z0-9_.:/@#-]+$/.test(t) &&
+            !path(t) &&
+            !/^use [a-z]+$/.test(t) &&
+            !/^[a-z]{2,3}-[A-Z]{2}$/.test(t) &&
+            !/^[A-Z0-9_]+$/.test(t);
+        if (!copy || seen.has(t)) return false;
+        seen.add(t);
+        return true;
+    });
+}
+
+/**
+ * A fingerprint of the copy scanner: its functions, the Go verb pattern, the
+ * regex keywords and the escapes. released-strings.json records it beside the
+ * copy lines it wrote, and a repository test compares the two, so a change to
+ * the scanner cannot leave the desktop and CLI lines read the old way (CI has
+ * no tags to read them again). Line ends are normalized, so a Windows checkout
+ * gets the same answer.
+ */
+export function copyScannerVersion() {
+    const text = [
+        unescape.toString(),
+        stringLiterals.toString(),
+        copyLines.toString(),
+        GO_VERB.source,
+        [...REGEX_AFTER].join(' '),
+        JSON.stringify(SIMPLE_ESCAPES),
+    ].join('\n');
+    return createHash('sha256')
+        .update(text.replace(/\r\n/g, '\n'))
+        .digest('hex')
+        .slice(0, 16);
+}
+
+// A text as the copy check compares it: quotes folded, white space
+// squeezed, every placeholder {} whatever its name, case ignored.
+function copyKey(text) {
+    return fold(squeeze(text))
+        .replace(new RegExp(PLACEHOLDER.source, 'g'), '{}')
+        .toLowerCase();
+}
+
+/**
+ * The copy lines of `file` that no row covers. A row covers a line when its
+ * source is the file and the line sits in its text on word boundaries: a row
+ * may join a title and its body, so one row can cover two lines.
+ */
+export function uncoveredCopy(lines, rows, file) {
+    const texts = rows.filter((r) => r.source === file).map((r) => copyKey(r.text));
+    const wordy = /[a-z0-9]/;
+    return lines.filter((line) => {
+        const l = copyKey(line);
+        return !texts.some((t) => {
+            for (let at = t.indexOf(l); at >= 0; at = t.indexOf(l, at + 1)) {
+                const before = at > 0 ? t[at - 1] : '';
+                const after = t[at + l.length] ?? '';
+                if (wordy.test(l[0]) && wordy.test(before)) continue;
+                if (wordy.test(l[l.length - 1]) && wordy.test(after)) continue;
+                return true;
+            }
+            return false;
+        });
+    });
 }

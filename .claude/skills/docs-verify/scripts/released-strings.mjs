@@ -17,11 +17,18 @@
  * and the newest `desktop-v*` tag, so the file is keyed by surface first.
  * A capture manifest under docs/images/desktop or docs/images/cli records
  * strings seen in a picture of a released app; those are held to the same
- * refs and kept in the same lists.
+ * refs and kept in the same lists. Under `copy` it also records every copy
+ * line of the released apps' copy modules (COPY_FILES in message-match.mjs)
+ * as the tag has them, which is what the `messages` check holds the rows of
+ * those files to: every line needs a row.
  *
- * Run it at release prep, with the two tags the docs are about to describe,
- * and at no other time: between releases the file is supposed to stay behind
- * main. It reads git only (`git show <ref>:<path>`) and writes this one file.
+ * Run it at release prep, with the two tags the docs are about to describe.
+ * Between releases the file stays behind main: run it again only at the SAME
+ * two tags (they are in its `refs`), which is needed when a cli or desktop
+ * row or a desktop picture string is added or edited (the file lists only the
+ * strings that were rows when it was written) and when the copy scanner
+ * changes (`copyScanner`). Never move the tags between releases. It reads git
+ * only (`git show <ref>:<path>`) and writes this one file.
  *
  * Usage:
  *   node released-strings.mjs --cli <ref> --desktop <ref> [--root <repo>]
@@ -32,7 +39,13 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { haystack, textOccurs } from './message-match.mjs';
+import {
+    COPY_FILES,
+    copyLines,
+    copyScannerVersion,
+    haystack,
+    textOccurs,
+} from './message-match.mjs';
 import { MESSAGES_FILE } from './messages-index.mjs';
 
 export const RELEASED_FILE =
@@ -101,6 +114,20 @@ export function buildSnapshot({ refs, rows, captures = [], show }) {
                 why: 'in none of the files the picture names',
             });
     }
+    // The copy lines of each released copy module, in source order.
+    const copy = { cli: {}, desktop: {} };
+    for (const { surface, file } of COPY_FILES) {
+        if (!heldToRelease({ surface, source: file })) continue;
+        const text = show(refs[surface], file);
+        if (text === null)
+            missing.push({
+                surface,
+                text: '(its copy lines)',
+                source: file,
+                why: 'no such file',
+            });
+        else copy[surface][file] = copyLines(text, file);
+    }
     // Sorted, so a regenerated file differs only where a string did.
     const listed = (map) =>
         Object.fromEntries(
@@ -113,6 +140,8 @@ export function buildSnapshot({ refs, rows, captures = [], show }) {
             refs,
             cli: listed(found.cli),
             desktop: listed(found.desktop),
+            copy,
+            copyScanner: copyScannerVersion(),
         },
         missing,
     };

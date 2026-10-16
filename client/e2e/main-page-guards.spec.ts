@@ -1,8 +1,8 @@
 /**
  * What the main page does with a careless click or a stray drop: the leave
- * prompt while something depends on the tab, the window's own drop guard, a
- * dropped folder refused at the drop, and the in-app browser card when its
- * Copy cannot reach the clipboard.
+ * prompt while something depends on the tab, the page's own reloads waiting
+ * for that time, the window's own drop guard, a dropped folder refused at the
+ * drop, and the in-app browser card when its Copy cannot reach the clipboard.
  *
  * A browser shows a beforeunload prompt only after a person has used the
  * page, so every prompt cell clicks something first, as a person would have.
@@ -129,6 +129,107 @@ test('the page asks before it is left while a link is out or files are unsaved',
         const [download] = await Promise.all([receiverPage.waitForEvent('download'), downloadLink.click()]);
         await download.delete();
         expect(await wordmarkAsks(receiverPage)).toBe(false);
+    } finally {
+        await senderCtx.close();
+        await receiverCtx.close();
+    }
+});
+
+test('a deploy never reloads a tab that holds a transfer, and the next stale chunk after it does', async ({ browser }) => {
+    // The stale-bundle recovery goes through the reload gate (lib/reloadGate.ts):
+    // while the page holds the tab its request is dropped, so the tab keeps the
+    // bundle that runs its transfer, and a chunk that fails after the tab is let
+    // go reloads it as before. At version 1.11.1 it reloaded at once, and on a
+    // page nobody had clicked the unsaved file went with it.
+    //
+    // A room link opened in a tab nobody clicked waits instead of asking, but a
+    // Playwright page starts with sticky user activation (navigator.userActivation
+    // .hasBeenActive is true before any click), so that branch is pinned by
+    // lib/reloadGate.test.ts, and the next test covers a used page.
+    const { path: fixturePath } = createFixture(FIXTURE_DIR, 64 * 1024);
+    const senderCtx = await browser.newContext();
+    const receiverCtx = await optedOutContext(await browser.newContext());
+    const senderPage = await senderCtx.newPage();
+    const receiverPage = await receiverCtx.newPage();
+    let loads = 0;
+    receiverPage.on('load', () => {
+        loads += 1;
+    });
+    // A reload would meet the leave prompt while the tab is held; record any.
+    let asked = 0;
+    receiverPage.on('dialog', (dialog) => {
+        if (dialog.type() === 'beforeunload') asked += 1;
+        void dialog.dismiss();
+    });
+    const staleChunk = () =>
+        receiverPage.evaluate(() => {
+            window.dispatchEvent(new ErrorEvent('error', { message: 'Loading chunk 999 failed.' }));
+        });
+
+    try {
+        const link = await browserSenderSetup(senderPage, fixturePath);
+        await receiverPage.goto(link);
+        const downloadLink = receiverPage.locator('a[download]').first();
+        await expect(downloadLink).toBeVisible({ timeout: 30_000 });
+        const loaded = loads;
+
+        // The file is unsaved: a deploy is dropped, with no reload and no prompt.
+        await staleChunk();
+        await receiverPage.waitForTimeout(3_000);
+        expect(loads).toBe(loaded);
+        expect(asked).toBe(0);
+        await expect(downloadLink).toBeVisible();
+
+        // Saved from its own link: the page lets go, and the dropped request
+        // does not come back.
+        const [download] = await Promise.all([receiverPage.waitForEvent('download'), downloadLink.click()]);
+        expect(await download.failure()).toBeNull();
+        await download.delete();
+        await receiverPage.waitForTimeout(3_000);
+        expect(loads).toBe(loaded);
+        expect(await receiverPage.evaluate(() => sessionStorage.getItem('floe:stale-bundle-reloaded-at'))).toBeNull();
+
+        // The next stale chunk, with nothing held, reloads the page at once and
+        // stamps the loop guard.
+        await staleChunk().catch(() => null);
+        await expect.poll(() => loads, { timeout: 15_000 }).toBeGreaterThan(loaded);
+        expect(asked).toBe(0);
+        expect(await receiverPage.evaluate(() => sessionStorage.getItem('floe:stale-bundle-reloaded-at'))).not.toBeNull();
+    } finally {
+        await senderCtx.close();
+        await receiverCtx.close();
+    }
+});
+
+test('a new room link in a tab the person used asks before it reloads', async ({ browser }) => {
+    // On a page the person has used, the room link reloads at once and the
+    // browser's leave prompt asks (lib/reloadGate.ts). The prompt is dismissed
+    // here, so the page stays with its unsaved file.
+    const { path: fixturePath } = createFixture(FIXTURE_DIR, 64 * 1024);
+    const nextRoom = '00000000-0000-4000-8000-000000000002';
+    const senderCtx = await browser.newContext();
+    const receiverCtx = await optedOutContext(await browser.newContext());
+    const senderPage = await senderCtx.newPage();
+    const receiverPage = await receiverCtx.newPage();
+    try {
+        const link = await browserSenderSetup(senderPage, fixturePath);
+        await receiverPage.goto(link);
+        const downloadLink = receiverPage.locator('a[download]').first();
+        await expect(downloadLink).toBeVisible({ timeout: 30_000 });
+        await receiverPage.locator('body').click({ position: { x: 5, y: 5 } });
+        let asked = false;
+        const onDialog = (dialog: import('@playwright/test').Dialog) => {
+            if (dialog.type() === 'beforeunload') asked = true;
+            void dialog.dismiss();
+        };
+        receiverPage.on('dialog', onDialog);
+        try {
+            await receiverPage.goto(link.replace(/#.*/, `#room=${nextRoom}`));
+            await expect.poll(() => asked, { timeout: 5_000 }).toBe(true);
+        } finally {
+            receiverPage.off('dialog', onDialog);
+        }
+        await expect(downloadLink).toBeVisible();
     } finally {
         await senderCtx.close();
         await receiverCtx.close();

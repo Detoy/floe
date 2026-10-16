@@ -82,6 +82,29 @@ function mouseClick(el: HTMLElement) {
     fireEvent.click(el, {detail: 1});
 }
 
+describe('a held key (R2-07 c)', () => {
+    // Focus moves to Make another link after Close link or Cancel drop, so the
+    // auto-repeat of the Enter that pressed them would press it too.
+    it('Make another link and Keep waiting refuse an auto-repeated key, never a first press', () => {
+        for (const [phase, name] of [['done', 'Make another link'], ['stopped', 'Make another link'], ['ended', 'Make another link'], ['declined', 'Keep waiting']] as const) {
+            const {unmount} = render(<RequestLinkView {...at(phase)}/>);
+            const b = screen.getByRole('button', {name});
+            expect(fireEvent.keyDown(b, {key: 'Enter', repeat: true}), `${phase}: a repeat`).toBe(false);
+            expect(fireEvent.keyDown(b, {key: 'Enter'}), `${phase}: a first press`).toBe(true);
+            unmount();
+        }
+    });
+
+    it('a held Enter on Make another link presses it once', async () => {
+        const user = userEvent.setup();
+        const p = at('ended');
+        render(<RequestLinkView {...p}/>);
+        act(() => screen.getByRole('button', {name: 'Make another link'}).focus());
+        await user.keyboard('{Enter>4}');
+        expect(p.onMakeAnother).toHaveBeenCalledTimes(1);
+    });
+});
+
 describe('the Accept guard', () => {
     beforeEach(() => {
         vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date']});
@@ -93,8 +116,9 @@ describe('the Accept guard', () => {
 
     it('Keep waiting has the guard too, so a double click on Decline cannot reopen the link (A5-12)', () => {
         // The second click of a double click lands where Decline was, which is
-        // Keep waiting once Declined renders; a held Enter lands there too now
-        // that focus moves to it. Both are ignored for 1 s.
+        // Keep waiting once Declined renders. Ignored for 1 s; focus after
+        // Decline goes to the declined line (R5-10), and a held key's repeats
+        // are ignored at any time (R2-07 c).
         const p = at('declined');
         render(<RequestLinkView {...p}/>);
         const keep = screen.getByRole('button', {name: 'Keep waiting'});
@@ -387,7 +411,7 @@ describe('the result card', () => {
         rerender(<RequestLinkView {...at('stopped')} snap={snap({state: 'stopped', code: 'disk-full', result: {...result, files: 1, saved: 1}})}/>);
         expect(screen.getByText('The drive ran out of space · 1 of 1 file saved')).toBeTruthy();
         rerender(<RequestLinkView {...at('stopped')} snap={snap({state: 'stopped', code: 'path-too-long', result: {...result, saved: 0}})}/>);
-        expect(screen.getByText('A folder path was too long for Windows · Nothing saved')).toBeTruthy();
+        expect(screen.getByText('A file name or folder path was too long for Windows · Nothing saved')).toBeTruthy();
         expect(document.body.textContent).not.toMatch(/send the rest/);
     });
 
@@ -738,6 +762,30 @@ describe('the layout (D-136)', () => {
         // A name that fits shows whole, and the title is still the full path.
         rerender(<RequestLinkView {...at('done')}/>);
         expect(screen.getByTitle(result.folder).textContent).toBe('Acme footage 2026-09-14 1405');
+    });
+
+    it('Done: the folder name keeps its date, time and (n) whole, and cuts a wide label by display columns (R5-11)', () => {
+        // The test's own column count, independent of the one paths.ts uses:
+        // CJK, Hangul, fullwidth forms and pictographs take two columns.
+        const wide = /[ᄀ-ᅟ⺀-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦]|\p{Extended_Pictographic}/u;
+        const displayCols = (s: string) => Array.from(s).reduce((n, c) => n + (wide.test(c) ? 2 : 1), 0);
+        // Wide glyphs take two columns of 12 px mono, so a CJK or emoji label
+        // that counted one per character overflowed and CSS cut the time off.
+        for (const [label, leaf] of [
+            ['日本語のフォルダ名がとても長いです', ' 2026-10-08 1405'],
+            ['📁🎬📷🎵📁🎬📷🎵📁🎬📷🎵', ' 2026-10-08 1405'],
+            ['Acme footage for the October shoot', ' 2026-10-08 1405 (2)'],
+        ]) {
+            const folder = `D:\\Footage\\Floe requests\\${label}${leaf}`;
+            const {unmount} = render(<RequestLinkView {...at('done')} snap={snap({state: 'done', result: {...result, folder}})}/>);
+            const shown = screen.getByTitle(folder).textContent!;
+            expect(shown.endsWith(leaf), shown).toBe(true);
+            expect(displayCols(shown), shown).toBeLessThanOrEqual(32);
+            expect(shown.includes('...'), shown).toBe(true);
+            // Never half a surrogate pair.
+            expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(shown), shown).toBe(false);
+            unmount();
+        }
     });
 
     it('a label with no spaces wraps inside the card on every heading that carries it (FU-38)', () => {
@@ -1348,6 +1396,21 @@ describe('Auto-accept (D-173, D-174)', () => {
         expect(screen.queryByText(/Accepts automatically/)).toBeNull();
     });
 
+    it('an automatic link on a drive that cannot mark files says it will ask (W5c, answer 19)', () => {
+        render(<RequestLinkView {...at('waiting')} snap={snap({state: 'waiting', autoAccept: true, autoAsks: 'no-mark', saveDir: 'G:\\Floe'})}/>);
+        const line = screen.getByText(/^Ends .* · Asks first, Windows can't mark files on G:$/);
+        expect(line.className).toContain('text-zinc-400');
+        expect(screen.queryByText(/Accepts automatically/)).toBeNull();
+    });
+
+    it('a prompt on an automatic link whose route could not be read says why, in gray (P13d, answer 19)', () => {
+        const asked = snap({state: 'deciding', autoAccept: true, route: '', prompt: {...prompt, warnings: ['auto-route-unknown']}});
+        render(<RequestLinkView {...at('deciding', {snap: asked})}/>);
+        const reason = screen.getByText("Asks because Floe couldn't check the connection");
+        expect(reason.className).toContain('text-zinc-400');
+        expect(reason.className).not.toContain('amber');
+    });
+
     it('a prompt on an automatic link gives its reason in gray, while a warning stays amber (D-176, D-177)', () => {
         const asked = snap({state: 'deciding', autoAccept: true, saveDir: 'C:\\Users\\x\\Downloads\\Floe', prompt: {...prompt, freeBytes: 30 * GB, warnings: ['auto-floor'], floorBytes: 48 * GB}});
         const {rerender} = render(<RequestLinkView {...at('deciding', {snap: asked})}/>);
@@ -1387,5 +1450,32 @@ describe('Auto-accept (D-173, D-174)', () => {
         const {container} = render(<RequestLinkView {...at('ready')}/>);
         await user.click(toggle());
         expect(closingPeriods(container)).toEqual([]);
+    });
+});
+
+// Deep QA A5-10: Cancel drop returns at once, and the drop stops only when its
+// receive returns, seconds later or up to 5 minutes inside a commit retry.
+// The same button says the stop was taken and takes no second click.
+describe('Cancel drop while the drop stops', () => {
+    it('reads Stopping, disabled, on the same button, and calls nothing', async () => {
+        const onCancelDrop = vi.fn();
+        const {rerender} = render(<RequestLinkView {...at('receiving', {onCancelDrop})}/>);
+        const button = screen.getByRole('button', {name: /Cancel drop/});
+        await userEvent.click(button);
+        expect(onCancelDrop).toHaveBeenCalledTimes(1);
+        rerender(<RequestLinkView {...at('receiving', {onCancelDrop, stopping: true})}/>);
+        const stopping = screen.getByRole('button', {name: /Stopping/});
+        expect(stopping).toBe(button);
+        expect((stopping as HTMLButtonElement).disabled).toBe(true);
+        expect(screen.queryByRole('button', {name: /Cancel drop/})).toBeNull();
+        await userEvent.click(stopping);
+        expect(onCancelDrop).toHaveBeenCalledTimes(1);
+    });
+
+    it('is Cancel drop again for a drop that is not stopping', () => {
+        render(<RequestLinkView {...at('receiving', {stopping: false})}/>);
+        const button = screen.getByRole('button', {name: /Cancel drop/});
+        expect((button as HTMLButtonElement).disabled).toBe(false);
+        expect(screen.queryByText('Stopping')).toBeNull();
     });
 });

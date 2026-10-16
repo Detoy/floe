@@ -476,9 +476,9 @@ func (a *App) runSend(g uint64, paths []string, hideIP bool) {
 // webview never touches the data channel.
 //
 // Progress is reported to the UI via Wails events:
-//   - "recv:incoming"  IncomingInfo                 as the sender's first metadata arrives
-//   - "recv:progress"  Progress                     throttled to ten a second
-//   - "recv:file-done" {savedName, bytes, verified} once per committed file
+//   - "recv:incoming"  IncomingInfo as the sender's first metadata arrives
+//   - "recv:progress"  Progress     throttled to ten a second
+//   - "recv:file-done" FileDone     once per committed file (renamed is always false here: no name hook)
 //
 // Returns the absolute output directory on success.
 func (a *App) ReceiveByCode(codeOrLink string, outputDir string, hideIP bool, reportStats bool) (string, error) {
@@ -800,7 +800,12 @@ func (a *App) runRequestDrop(rg uint64, sc *signaling.Client, p requestPairing) 
 				a.emitRequest("request:progress", pr)
 			}
 		}),
-		OnFileDone: d.tally.add,
+		// The tally first, then the quit record from it (A5-09); the record
+		// exists from Accept, and no file is saved before Accept.
+		OnFileDone: func(fd transfer.FileDone) {
+			d.tally.add(fd)
+			d.record.fileDone()
+		},
 		UpdateHint: desktopUpdateHint,
 		Messages:   msgs,
 		Closed:     closed,
@@ -872,10 +877,11 @@ type requestDrop struct {
 	tally  dropTally
 	cap    *time.Timer // the 24 h cap, armed at Accept
 
-	files   int    // the visitor's announced count, for the result
-	folder  string // the drop's own folder, "" until Accept
-	outcome string // how a prompt ended without a drop: declined, expired, left
-	auto    bool   // accepted by the link's own choice, with no prompt (HA1, D-173)
+	files   int         // the visitor's announced count, for the result
+	folder  string      // the drop's own folder, "" until Accept
+	outcome string      // how a prompt ended without a drop: declined, expired, left
+	auto    bool        // accepted by the link's own choice, with no prompt (HA1, D-173)
+	record  *dropRecord // the quit record, from Accept (A5-09, requestquit.go)
 
 	statsURL string // the global stats endpoint read at pairing, "" with the switch off (E-32)
 
@@ -955,6 +961,11 @@ func (a *App) requestDecide(rg uint64, p requestPairing, d *requestDrop, in tran
 		if reason == "auto-floor" {
 			pr.FloorBytes = autoFloor(sp.capacity)
 		}
+	} else if p.autoAccept && len(pr.Warnings) == 0 {
+		// G4's other half: no warning, but a route this side could not
+		// read, so relay-over-cap could not be computed and the drop asks.
+		// It says so (P13d, W3 R2-08) rather than ask with no reason line.
+		pr.Warnings = append(pr.Warnings, "auto-route-unknown")
 	}
 	pg := a.openPrompt(rg, pr)
 	if pg == 0 {
@@ -1018,10 +1029,12 @@ func (a *App) acceptRequestDrop(rg uint64, p requestPairing, d *requestDrop, at 
 		a.attentionOff()
 		return transfer.Decision{Kind: transfer.DecisionRefuse, Code: transfer.CodeWriteFailed}
 	}
-	if !a.setDropCancel(rg, d.cancelFunc()) || !a.acceptDrop(rg, RequestResult{Files: d.files, Folder: folder, AutoAccepted: !prompted}) {
+	rec := newDropRecord(quitDropPath(), p.label, d.files, folder, !prompted, &d.tally)
+	if !a.setDropCancel(rg, d.cancelFunc(), rec) || !a.acceptDrop(rg, RequestResult{Files: d.files, Folder: folder, AutoAccepted: !prompted}) {
 		_ = os.Remove(folder)
 		return stopped
 	}
+	d.record = rec
 	d.folder = folder
 	d.auto = !prompted
 	d.accepted.Store(true)
@@ -1066,7 +1079,12 @@ func (a *App) endRequestDrop(rg uint64, sc *signaling.Client, d *requestDrop, er
 		if state == "stopped" && res.Saved == 0 {
 			removeEmptyDirs(d.folder) // empty folders only; anything in them stays
 		}
-		a.endDrop(rg, state, code, &res)
+		// A drop that still owned the lane goes to History through its own
+		// snapshot, so its quit record goes; one a quit ended keeps it for the
+		// next launch (A5-09).
+		if a.endDrop(rg, state, code, &res) {
+			d.record.clear()
+		}
 		if state == "stopped" {
 			// E-32 (D-006): the files this drop saved under their final names
 			// count toward the global stats, once, from here. The engine
@@ -1390,7 +1408,9 @@ type dropTally struct {
 }
 
 // add records one committed file. SavedName is the engine's on-disk name,
-// relative to the drop folder; a name the hook renamed ends in .floe-blocked.
+// relative to the drop folder. Renamed is the name hook's own answer: a name
+// that merely ends in .floe-blocked may be the visitor's own choice, which
+// the hook left alone, so the suffix never counts (A2-04).
 func (t *dropTally) add(d transfer.FileDone) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -1399,7 +1419,7 @@ func (t *dropTally) add(d transfer.FileDone) {
 	if d.Verified {
 		t.verified++
 	}
-	if strings.HasSuffix(d.SavedName, ".floe-blocked") {
+	if d.Renamed {
 		t.renamed++
 	}
 	if len(t.names) < requestResultNames {

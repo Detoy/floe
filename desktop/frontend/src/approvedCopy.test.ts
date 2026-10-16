@@ -95,6 +95,7 @@ function sized(s: string, gb: number): string {
 const END = new Date(2026, 8, 14, 14, 5).getTime();
 const MISSED = new Date(2026, 8, 14, 14, 14).getTime();
 const NOW = new Date(2026, 8, 14, 9, 30).getTime();
+const NEXT_DAY = new Date(2026, 8, 15, 9, 30).getTime();
 const GB = 1024 ** 3;
 const MB = 1024 ** 2;
 const LABEL = 'Acme footage';
@@ -107,7 +108,15 @@ const NOT_RENDERED_HERE: Record<string, string> = {
     V2: 'a value: the engine-cleaned file name, rendered as text',
     P1a: 'the one-sentence screen-reader form; A1 is the announcement that ships',
     DN11: 'the canvas draws DN1 without DN3 for this case (DO-02)',
-    ST13: 'no source in Stage 1: a drop does not survive Floe closing',
+    // RX3 to RX9 (finish run 2026-10-16): no code receive can end with their
+    // engine sentences (errors.ts says why), so errors.ts maps them no more.
+    RX3: 'unreachable: over-approved needs ReceiveLimits, which a code receive never sets',
+    RX4: 'unreachable: relay-cap needs ReceiveLimits, which a code receive never sets',
+    RX5: 'unreachable: time-limit comes from the request lane only',
+    RX6: 'unreachable: expired comes from the request lane only',
+    RX7: 'unreachable: no code refuses with declined; a decline is ErrDeclined',
+    RX8: 'unreachable: stopped comes from the request lane only',
+    RX9: 'unreachable: a failed commit is CommitError (RX10), never save-blocked',
     CP1: 'an existing app string (App.tsx, Code or link)',
     CL1: 'an existing app string (App.tsx, Close Floe?)',
     T1: 'the window title, set in Go (S1-DSK-05)',
@@ -177,6 +186,7 @@ describe.skipIf(!present)(present ? 'the approved desktop copy' : 'the approved 
         expect(c.errorLine('relay-unknown')).toBe(approved('E6'));
         expect(c.errorLine('already-open')).toBe(approved('E7'));
         expect(c.errorLine('save-folder')).toBe(approved('E9'));
+        expect(c.errorLine('unsupported')).toBe(approved('E10'));
         expect(c.errorLine('disabled')).toBe(approved('X6'));
     });
 
@@ -191,22 +201,29 @@ describe.skipIf(!present)(present ? 'the approved desktop copy' : 'the approved 
         expect(c.scopeLine(END, NOW, true)).toBe(approved('W5a'));
         // W5b is drawn at 9:31 PM on drive C:.
         expect(c.scopeLine(new Date(2026, 8, 14, 21, 31).getTime(), NOW, true, 'low-space', 'C:\\Users\\x\\Downloads\\Floe')).toBe(approved('W5b'));
+        // W5c (answer 19, 2026-10-16) in W5b's shape, drawn at the same time
+        // on drive G:, P13b's drive.
+        expect(c.scopeLine(new Date(2026, 8, 14, 21, 31).getTime(), NOW, true, 'no-mark', 'G:\\Floe')).toBe(approved('W5c'));
         expect(c.WAITING_LINE).toBe(approved('W8'));
-        expect(c.missedLine(MISSED)).toBe(approved('W10'));
+        expect(c.missedLine(MISSED, NOW)).toBe(approved('W10'));
         expect(c.SETUP_FAILED_LINE).toBe(approved('W11'));
         expect(c.CONNECTING_LINE).toBe(approved('W12'));
         expect(c.SUGGEST_CLOSE_LINE).toBe(approved('W13'));
         expect(c.HIDE_IP_NO_RELAY_LINE).toBe(approved('W14'));
-        expect(c.reopenLine({code: 'no-relay', suggestClose: false})).toBe(approved('W14'));
-        expect(c.reopenLine({code: 'relay-unknown', suggestClose: false})).toBe(approved('W14'));
+        expect(c.reopenLine({code: 'no-relay', suggestClose: false}, NOW)).toBe(approved('W14'));
+        expect(c.reopenLine({code: 'relay-unknown', suggestClose: false}, NOW)).toBe(approved('W14'));
         // C1 is drawn on two lines: "line 1 / line 2" in the table.
         expect(`${c.RECONNECTING_LINE} / ${c.RECONNECTING_NOTE}`).toBe(bare('C1'));
         expect(`${c.RETRY_NOW} / ${c.CLOSE_LINK}`).toBe(bare('C2'));
-        expect(c.endedLine('expired', END)).toBe(approved('X1'));
-        expect(c.endedLine('closed', END)).toBe(approved('X2'));
+        expect(c.endedLine('expired', END, NOW)).toBe(approved('X1'));
+        expect(c.endedLine('closed', END, NOW)).toBe(approved('X2'));
         expect(c.MAKE_ANOTHER_LINK).toBe(approved('X3'));
         // X5 is cut (D-170): an app-closed code reads as a close.
-        expect(c.endedLine('app-closed', END)).toBe(approved('X2'));
+        expect(c.endedLine('app-closed', END, NOW)).toBe(approved('X2'));
+        // W10a and X1a: the same times read the day after, dated in fmtEnds'
+        // form (finish run 2026-10-16).
+        expect(c.missedLine(MISSED, NEXT_DAY)).toBe(approved('W10a'));
+        expect(c.endedLine('expired', END, NEXT_DAY)).toBe(approved('X1a'));
     });
 
     it('Prompt and Declined rows match byte for byte', () => {
@@ -233,6 +250,8 @@ describe.skipIf(!present)(present ? 'the approved desktop copy' : 'the approved 
         expect(c.warningLine('auto-floor', {...p, floorBytes: 48 * GB}, 'C:\\Floe')).toBe(approved('P13a'));
         expect(c.warningLine('auto-no-mark', p, 'G:\\Floe')).toBe(approved('P13b'));
         expect(c.warningLine('auto-unknown', p, 'D:\\Floe')).toBe(approved('P13c'));
+        // P13d (answer 19, 2026-10-16) names no drive.
+        expect(c.warningLine('auto-route-unknown', p, 'D:\\Floe')).toBe(approved('P13d'));
         expect(c.DECLINED_LINE).toBe(approved('D1'));
         expect(c.DECLINED_QUESTION).toBe(approved('D2'));
         expect(`${c.KEEP_WAITING} / ${c.CLOSE_LINK}`).toBe(bare('D3'));
@@ -244,6 +263,7 @@ describe.skipIf(!present)(present ? 'the approved desktop copy' : 'the approved 
         const v3 = [c.receivedOf(1.2 * GB, 2.5 * GB), fmtSpeed(38 * MB), c.timeLeft(fmtEta(34))];
         expect(v3.join('   ')).toBe(approved('V3'));
         expect(c.CANCEL_DROP).toBe(approved('V4'));
+        expect(c.STOPPING).toBe(approved('V4a'));
         expect(c.ETA_OVER_2H_LINE).toBe(approved('V5'));
         expect(c.etaLongLine(3 * 86400)).toBe(approved('V6'));
     });
@@ -265,6 +285,8 @@ describe.skipIf(!present)(present ? 'the approved desktop copy' : 'the approved 
         expect(c.RECEIVED_FILES_LABEL).toBe(approved('DN13'));
         // History's gray line for a drop the link took by itself (D-173).
         expect(c.ACCEPTED_AUTOMATICALLY_LINE).toBe(approved('HA1'));
+        // History's title for an unlabeled drop that saved no file.
+        expect(c.NOTHING_SAVED).toBe(approved('HT1'));
     });
 
     it('Stopped rows match byte for byte, card body and History form', () => {
@@ -272,7 +294,7 @@ describe.skipIf(!present)(present ? 'the approved desktop copy' : 'the approved 
         const stops: Array<[string, string]> = [
             ['ST1', 'disk-full'], ['ST3', 'hash-mismatch'], ['ST4', 'path-too-long'], ['ST5', 'over-approved'],
             ['ST6', 'relay-cap'], ['ST7', 'file-too-large-for-folder'], ['ST8', 'write-failed'], ['ST9', 'save-blocked'],
-            ['ST10', 'stopped'], ['ST11', 'peer-abort'], ['ST12', 'time-limit'], ['ST14', 'unknown'],
+            ['ST10', 'stopped'], ['ST11', 'peer-abort'], ['ST12', 'time-limit'], ['ST13', 'app-closed'], ['ST14', 'unknown'],
         ];
         const st16 = bare('ST16');
         const whenSaved = ' plus ST16 when at least one file was saved';
@@ -328,20 +350,14 @@ describe.skipIf(!present)(present ? 'the approved desktop copy' : 'the approved 
         expect(c.ANNOUNCE_GUARD_LIFTED).toBe(approved('A2'));
     });
 
-    it('Code receive error rows RX1 to RX10 match byte for byte', () => {
+    it('Code receive error rows RX1, RX2 and RX10 match byte for byte', () => {
         // The engine's fixed sentence per code (refusal.go RefusedError.Error()
         // and CommitError.Error(), approved-copy-cli.txt RX-01 to RX-10) as
         // ReceiveByCode wraps it, through friendlyError to the status line.
+        // RX3 to RX9 are in NOT_RENDERED_HERE: no code receive ends with them.
         const engine: Array<[id: string, sentence: string]> = [
             ['RX1', "receive stopped: a file's path is too deep or too long to save in this folder"],
             ['RX2', 'receive stopped: a file is larger than the save drive can hold'],
-            ['RX3', 'receive stopped: more data arrived than this transfer announced'],
-            ['RX4', 'receive stopped: relayed transfers are capped at 2 GB'],
-            ['RX5', 'receive stopped: the transfer reached its 24-hour limit'],
-            ['RX6', 'receive stopped: nobody answered in time'],
-            ['RX7', 'receive stopped: the transfer was declined'],
-            ['RX8', 'receive stopped: the transfer was stopped on this computer'],
-            ['RX9', 'receive stopped: a finished file could not be moved into place'],
             ['RX10', 'received a file in full but could not finish saving it; the complete file was kept in the save folder with a .part ending'],
         ];
         for (const [id, sentence] of engine) {
@@ -375,7 +391,7 @@ describe.skipIf(!present)(present ? 'the approved desktop copy' : 'the approved 
             [...rows.values()].filter((r) => !isCut(r)).map((r) => r.string.replace(/ \([^()]*\)$/, '')),
         );
         for (const code of ['denied', 'too-slow', 'network', 'server-restart', 'battery-standby', 'pending-rename', 'web-address', 'file-too-large-for-drive']) {
-            out.push(c.errorLine(code), c.endedLine(code, END), c.stoppedCard(code, 4, 12), c.stoppedFull(code, 4, 12),
+            out.push(c.errorLine(code), c.endedLine(code, END, NOW), c.stoppedCard(code, 4, 12), c.stoppedFull(code, 4, 12),
                 c.warningLine(code, {freeBytes: 1, totalBytes: 1}, SAVE));
         }
         for (const r of cut) {

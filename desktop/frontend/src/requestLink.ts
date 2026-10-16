@@ -89,8 +89,9 @@ export interface RequestLinkSnapshot {
     /** The link's own Auto-accept switch (D-173): true when a drop that needs
      *  no asking is accepted at once. Per link, never remembered. */
     autoAccept: boolean;
-    /** low-space while a link that accepts automatically sits on a drive
-     *  already under its floor, so every drop asks (D-176). */
+    /** Why every drop asks on a link that accepts automatically: low-space
+     *  while its drive is already under the floor (D-176, W5b), no-mark while
+     *  its drive cannot carry the downloaded-file mark (W5c). */
     autoAsks?: string;
     route: string;
     reconnectUntil?: number;
@@ -141,6 +142,10 @@ export interface RequestResult {
     /** The link took this drop by its own choice, with no prompt (HA1,
      *  D-173). Absent reads as not automatic. */
     autoAccepted?: boolean;
+    /** Set only on the stopped drop a launch shows for a drop Floe closed
+     *  during (app-closed, ST13): when Go last recorded it, in unix
+     *  milliseconds, which History dates the row by. */
+    endedAt?: number;
 }
 
 /** A Link ends key: the fixed set Go's requestLifetime takes (D-173). Nothing
@@ -197,6 +202,9 @@ export function linkOpen(state: string): boolean {
 // not qualify asks, or after it was declined: "Accepts automatically" over
 // an Accept prompt would contradict the prompt (D-173, review R2 F2).
 const AUTO_SHOWN = new Set(['waiting', 'reconnecting', 'connecting']);
+/** The autoAsks values the bridge may send (requestauto.go autoSpaceFn); any
+ *  other value reads as none, so the line says "Accepts automatically". */
+const AUTO_ASKS = new Set(['low-space', 'no-mark']);
 
 /** autoAcceptShown: the link says, right now, that it accepts by itself. */
 export function autoAcceptShown(snap: {autoAccept: boolean; state: string}): boolean {
@@ -219,12 +227,23 @@ export interface RequestUI {
      *  before the first progress event, since a receiving snapshot need not
      *  carry the prompt (D-136). Never a visitor string (OD-04). */
     accepted: {gen: number; files: number; folder: string} | null;
+    /** The generation whose drop the owner asked to stop with Cancel drop, or
+     *  null. Go answers only once the drop has stopped, which can take
+     *  seconds (deep QA A5-10), so until then the button reads Stopping and
+     *  takes no second click (stoppingDrop). */
+    stopping: number | null;
 }
 
 export const initialRequestUI: RequestUI = {
     snap: OFF_SNAPSHOT, making: false, hiddenKey: '', localError: '',
-    accepted: null,
+    accepted: null, stopping: null,
 };
+
+/** stoppingDrop: Cancel drop was pressed for the drop on screen, which still
+ *  receives. Any later state, or a newer generation, ends it by itself. */
+export function stoppingDrop(ui: RequestUI): boolean {
+    return ui.stopping !== null && ui.stopping === ui.snap.gen && ui.snap.state === 'receiving';
+}
 
 /** keepAccepted is the accepted field after adopting `snap`: its prompt when it
  *  carries one, the one already kept while the generation holds, else none. */
@@ -247,12 +266,13 @@ export type RequestEvent =
     | {type: 'MAKE_FAILED'}
     | {type: 'ACK_ERROR'}
     | {type: 'MAKE_ANOTHER'}
+    // Cancel drop: the one local state Go's next snapshot ends (stopping).
+    | {type: 'CANCEL_DROP'}
     // No state of their own: Go answers each with a snapshot. They exist so a
     // caller can dispatch them and the tests can show they change nothing
     // locally (T9, T14, T15, T17, T18, T20, T23).
     | {type: 'CLOSE'}
     | {type: 'ANSWER'; answer: string}
-    | {type: 'CANCEL_DROP'}
     | {type: 'GUARD_TICK'}
     | {type: 'WINDOW_FOCUS'};
 
@@ -294,7 +314,7 @@ export function normalizeSnapshot(raw: unknown): RequestLinkSnapshot {
         expiresAt: num(r.expiresAt),
         // Automatic only when the bridge says exactly true (G1: fail closed).
         autoAccept: r.autoAccept === true,
-        ...(str(r.autoAsks) === 'low-space' ? {autoAsks: 'low-space'} : {}),
+        ...(AUTO_ASKS.has(str(r.autoAsks)) ? {autoAsks: str(r.autoAsks)} : {}),
         route: str(r.route),
         suggestClose: r.suggestClose === true,
         battery: r.battery === true,
@@ -325,6 +345,7 @@ export function normalizeSnapshot(raw: unknown): RequestLinkSnapshot {
             folder: str(res.folder),
             ...namesAndSizes(res.names, res.sizes),
             autoAccepted: res.autoAccepted === true,
+            ...(num(res.endedAt) > 0 ? {endedAt: num(res.endedAt)} : {}),
         };
     }
     return out;
@@ -381,6 +402,9 @@ export function reduce(ui: RequestUI, ev: RequestEvent): RequestUI {
             if (p !== 'done' && p !== 'stopped' && p !== 'ended' && p !== 'error') return ui;
             return {...ui, localError: '', hiddenKey: keyOf(ui.snap)};
         }
+        case 'CANCEL_DROP':
+            if (ui.snap.state !== 'receiving' || stoppingDrop(ui)) return ui;
+            return {...ui, stopping: ui.snap.gen};
         default:
             return ui;
     }
@@ -414,6 +438,15 @@ export function noticeVisible(snap: RequestLinkSnapshot, onRequestView: boolean,
 export function canMake(p: Phase): boolean {
     return p === 'ready' || p === 'error';
 }
+
+/** How long after Retry now a phase change still counts as its outcome for
+ *  focus (R2-07). Retry only nudges the lane's reconnect loop, and an attempt
+ *  that fails leaves the phase as it was, so the next change may come long
+ *  after from something the owner did not do (the link's end, a reconnect of
+ *  the loop's own). 10 s is the host join's own reply wait (replyTimeout in
+ *  cli/engine/signaling/client.go); the dial before it is not counted, so an
+ *  attempt slower than that leaves focus where it fell, on the page. */
+export const RETRY_FOCUS_MS = 10_000;
 
 /** The Accept and Decline guard (spec 06 5.5, E-44): 1 s after the prompt
  *  renders and 1 s after the window regains focus. */

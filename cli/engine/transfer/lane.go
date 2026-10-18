@@ -16,12 +16,6 @@ import (
 // the same answer (ReceiveLimits.FreeReserve).
 func DiskFree(dir string) (int64, error) { return diskFree(dir) }
 
-// VolumeMaxFileSize reports the largest single file the volume under dir can
-// hold: 4294967295 on FAT and FAT32, 0 when there is no limit this code knows
-// of or the platform cannot say. The lane reads it for the prompt's
-// drive-limit warning; layer 1 refuses a larger file on its own.
-func VolumeMaxFileSize(dir string) (int64, error) { return volumeMaxFileSize(dir) }
-
 // VolumeNamedStreams reports whether the volume under dir can carry the
 // Windows downloaded-file mark, the Zone.Identifier stream applyMOTW writes:
 // false on FAT32, exFAT and many network shares, where Windows then has
@@ -34,14 +28,6 @@ func VolumeNamedStreams(dir string) (bool, error) { return volumeNamedStreams(di
 // step 12). There is no throughput floor and no too-slow code (E-24): a drop
 // that is merely slow runs until this cap or the 60 s stall watchdog.
 const DropTimeLimit = 24 * time.Hour
-
-// DropTimeLimitReached reports whether a drop that started at startedAt has
-// run for DropTimeLimit or longer at now. The lane stops such a drop with
-// AbortWithCode(CodeTimeLimit) and closes the connection. Pure, so a test can
-// hand it any clock.
-func DropTimeLimitReached(startedAt, now time.Time) bool {
-	return now.Sub(startedAt) >= DropTimeLimit
-}
 
 // StartIncomingDeadline arms the open-channel deadline (E-35, spec 06 4.5
 // step 9): onExpire runs on its own goroutine once d has passed, unless cancel

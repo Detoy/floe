@@ -129,9 +129,6 @@ func reportBytesToServer(serverURL string, byteCount int64) {
 // so does a count of zero or less. Synchronous, with reportBytesToServer's
 // 5 s timeout, and errors are ignored.
 func ReportStats(serverURL string, byteCount int64) {
-	if byteCount <= 0 {
-		return
-	}
 	reportBytesToServer(serverURL, byteCount)
 }
 
@@ -203,29 +200,17 @@ type ReceiveOptions struct {
 	Closed   <-chan struct{}
 }
 
-// ReceiveFiles handles the full receiving side of the Floe protocol.
-// It blocks until all files are received. Files are written to outputDir.
-// If autoAccept is false, the user is prompted before receiving begins.
-// localVer is the human release string (e.g. "v1.5.5") embedded in the ack
-// for the optional peer-version note; pass "" for dev builds or tests.
+// ReceiveFilesWithOptions handles the full receiving side of the Floe
+// protocol. It blocks until all files are received. Files are written to
+// outputDir. If autoAccept is false and opts.Decide is nil, the user is
+// prompted before receiving begins. localVer is the human release string
+// (e.g. "v1.5.5") embedded in the ack for the optional peer-version note;
+// pass "" for dev builds or tests.
 // serverURL is the signaling server base URL used to report transfer stats;
-// pass "" to skip reporting (e.g. in tests).
-func ReceiveFiles(dc *webrtc.DataChannel, outputDir string, autoAccept bool, localVer string, serverURL string) error {
-	return ReceiveFilesWithOptions(dc, outputDir, autoAccept, localVer, serverURL, ReceiveOptions{})
-}
-
-// ReceiveFilesWithProgress is ReceiveFiles with a progress callback for GUI
-// clients. When onProgress is non-nil, per-chunk progress is reported through it
-// and the terminal progress bar is suppressed.
-func ReceiveFilesWithProgress(dc *webrtc.DataChannel, outputDir string, autoAccept bool, localVer string, serverURL string, onProgress ProgressFunc) error {
-	return ReceiveFilesWithOptions(dc, outputDir, autoAccept, localVer, serverURL, ReceiveOptions{OnProgress: onProgress})
-}
-
-// ReceiveFilesWithOptions is the full-featured receive entry point; the other
-// two delegate here. opts.OnIncoming, when set, fires exactly once as the
-// first metadata arrives, after the protocol compatibility check and before
-// any file is created or acked, and opts.Decide is asked at that same point
-// whether the transfer happens at all.
+// pass "" to skip reporting (e.g. in tests). opts.OnIncoming, when set, fires
+// exactly once as the first metadata arrives, after the protocol compatibility
+// check and before any file is created or acked, and opts.Decide is asked at
+// that same point whether the transfer happens at all.
 func ReceiveFilesWithOptions(dc *webrtc.DataChannel, outputDir string, autoAccept bool, localVer string, serverURL string, opts ReceiveOptions) error {
 	onProgress := opts.OnProgress
 	// Where this receive claims, reports and saves: outputDir until a Decide
@@ -270,7 +255,6 @@ func ReceiveFilesWithOptions(dc *webrtc.DataChannel, outputDir string, autoAccep
 		msgCh, done = ch, d
 	}
 
-	// Process messages sequentially
 	var currentFile *os.File // the .part staging file the bytes are written to
 	var currentInfo FileInfo
 	var currentDisplayName string // displayText(currentInfo.FileName): every print, callback and error uses this, never the raw name
@@ -448,7 +432,6 @@ func ReceiveFilesWithOptions(dc *webrtc.DataChannel, outputDir string, autoAccep
 				return &CompatError{LocalTooOld: localTooOld, text: compatErrorFromIncompatible(localVer, opts.UpdateHint, incompat)}
 
 			case "metadata":
-				// A new file is starting
 				info, err := parseMetadata(string(msg.Data))
 				if err != nil {
 					// classifyControl already proved this is a metadata object, so a failure
@@ -798,7 +781,6 @@ func ReceiveFilesWithOptions(dc *webrtc.DataChannel, outputDir string, autoAccep
 				dc.Send([]byte(ackJSON))
 
 			case "end":
-				// Current file is complete
 				if currentFile != nil {
 					staged := currentFile
 					partPath := staged.Name()
@@ -904,7 +886,7 @@ func ReceiveFilesWithOptions(dc *webrtc.DataChannel, outputDir string, autoAccep
 					finalPath, commitErr := commitPart(partPath, currentDest, currentBase, commitRetry)
 					if commitErr != nil {
 						AbortWithCode(dc, localVer, CodeSaveBlocked, CodeSaveBlocked.WireReason(), filesReceived)
-						return &CommitError{PartPath: partPath, Dest: currentDest, Base: currentBase, Err: commitErr}
+						return &CommitError{PartPath: partPath, Err: commitErr}
 					}
 
 					// External interference only: something claimed the final name
@@ -1019,7 +1001,6 @@ func ReceiveFilesWithOptions(dc *webrtc.DataChannel, outputDir string, autoAccep
 			continue
 		}
 
-		// Binary chunk — write directly to disk
 		if currentFile == nil {
 			continue // no file open yet; shouldn't happen in normal flow
 		}

@@ -166,12 +166,13 @@ type endMsg struct {
 }
 
 // controlFields reads a receiver's frame as a JSON object and its "type" by
-// EXACT key, the way parseReceived does and the browser's classifyControl
-// does. A struct tag would match "TYPE" too, so a frame the browser ignores
-// used to be honored here. An absent key is a nil RawMessage, which fails to
-// decode, so absent and mistyped both read as "not this frame"; a duplicate
-// key keeps its last value on both sides. Over the control cap is never
-// parsed: that is file data or prose where a control message belongs.
+// EXACT key, the way the browser's classifyControl does; parseReceived and
+// parseAckConfirms read through it. A struct tag would match "TYPE" too, so a
+// frame the browser ignores used to be honored here. An absent key is a nil
+// RawMessage, which fails to decode, so absent and mistyped both read as "not
+// this frame"; a duplicate key keeps its last value on both sides. Over the
+// control cap is never parsed: that is file data or prose where a control
+// message belongs.
 func controlFields(raw []byte) (fields map[string]json.RawMessage, typ string, ok bool) {
 	if len(raw) > controlMsgMax {
 		return nil, "", false
@@ -431,17 +432,13 @@ func savedCountIn(fields map[string]json.RawMessage, total int) int {
 // "all matched". The count is the receiver's claim, used only for equality
 // with the file count.
 //
-// The type is read by its exact key too. A struct tag matches keys without
-// regard to case, so {"TYPE":"received"} used to count as a delivery
-// confirmation here while the browser twin ignores it (found by
+// The type is read by its exact key too, through controlFields. A struct tag
+// matches keys without regard to case, so {"TYPE":"received"} used to count
+// as a delivery confirmation here while the browser twin ignores it (found by
 // FuzzParseReceived, CP-0 campaign, 2026-09-18).
 func parseReceived(raw []byte, files int) (ok bool, verified int, hasVerified bool) {
-	if len(raw) > controlMsgMax {
-		return false, 0, false
-	}
-	var fields map[string]json.RawMessage
-	var typ string
-	if json.Unmarshal(raw, &fields) != nil || json.Unmarshal(fields["type"], &typ) != nil || typ != "received" {
+	fields, typ, ok := controlFields(raw)
+	if !ok || typ != "received" {
 		return false, 0, false
 	}
 	lit := fields["verified"]
@@ -639,18 +636,11 @@ func stopRequested(stop <-chan struct{}) bool {
 	}
 }
 
-// SendFiles sends all given file paths over the open data channel, rendering a
-// terminal progress bar. Folders are walked recursively. localVer is the human
-// release string (e.g. "v1.5.5") embedded in metadata; pass "" for dev/tests.
-func SendFiles(dc *webrtc.DataChannel, paths []string, localVer string) error {
-	return SendFilesWithOptions(dc, paths, localVer, SendOptions{})
-}
-
-// SendFilesWithOptions is the full-featured send entry point; SendFiles
-// delegates here.
+// SendFilesWithOptions sends all given file paths over the open data channel.
+// Folders are walked recursively. localVer is the human release string (e.g.
+// "v1.5.5") embedded in metadata; pass "" for dev/tests. The zero SendOptions
+// renders a terminal progress bar.
 func SendFilesWithOptions(dc *webrtc.DataChannel, paths []string, localVer string, opts SendOptions) error {
-	onProgress := opts.OnProgress
-	// Expand paths: collect all files (walk directories)
 	files, err := collectFiles(paths)
 	if err != nil {
 		return err
@@ -671,7 +661,7 @@ func SendFilesWithOptions(dc *webrtc.DataChannel, paths []string, localVer strin
 	}
 
 	// Relay size cap: decide before wiring acks or sending any metadata. The
-	// connection is already established by the time SendFiles runs, so the
+	// connection is already established by the time this send runs, so the
 	// selected ICE pair is known. Mirrors the browser's relay gate.
 	if err := relayGate(dc, totalBytes); err != nil {
 		// Tell the receiver, or all it sees is a close. Its own diagnosis for
@@ -812,7 +802,7 @@ func SendFilesWithOptions(dc *webrtc.DataChannel, paths []string, localVer strin
 	var confirms bool
 	var sentSoFar int64
 	for i, entry := range files {
-		if err := sendFile(dc, ackCh, sendMore, done, flushed, entry, i+1, len(files), totalBytes, localVer, onProgress, onAck, opts.UpdateHint, ackTimeoutOrDefault(opts.AckTimeout), sentSoFar, chunk, &confirms, opts.Stop, opts.EndBarLine, opts.PeerVersionReleaseOnly); err != nil {
+		if err := sendFile(dc, ackCh, sendMore, done, flushed, entry, i+1, len(files), totalBytes, localVer, onAck, sentSoFar, chunk, &confirms, opts); err != nil {
 			// A refusal the PEER sent is returned as it came. The wrap named
 			// entry.displayName, which is the file the sender had already moved
 			// on to: a receiver refuses file N after its end marker, and the
@@ -986,10 +976,12 @@ drainLoop:
 
 // sendFile handles the full send sequence for a single file. confirms is set
 // from the first file's ack only (parseAckConfirms) and left alone after.
-// stop is SendOptions.Stop: seen before every write and in every wait.
-// endBarLine is SendOptions.EndBarLine, and peerVerReleaseOnly is
-// SendOptions.PeerVersionReleaseOnly.
-func sendFile(dc *webrtc.DataChannel, ackCh <-chan []byte, sendMore <-chan struct{}, done <-chan struct{}, flushed <-chan struct{}, entry fileEntry, index, total int, totalBytes int64, localVer string, onProgress ProgressFunc, onAck func(int), updateHint string, ackTimeout time.Duration, baseTotal int64, chunk int, confirms *bool, stop <-chan struct{}, endBarLine, peerVerReleaseOnly bool) (err error) {
+// onAck is SendFilesWithOptions' wrapper of opts.OnAck, which also restarts
+// the summary clock, so this calls onAck and never opts.OnAck. stop is
+// opts.Stop: seen before every write and in every wait.
+func sendFile(dc *webrtc.DataChannel, ackCh <-chan []byte, sendMore <-chan struct{}, done <-chan struct{}, flushed <-chan struct{}, entry fileEntry, index, total int, totalBytes int64, localVer string, onAck func(int), baseTotal int64, chunk int, confirms *bool, opts SendOptions) (err error) {
+	onProgress, updateHint, stop := opts.OnProgress, opts.UpdateHint, opts.Stop
+	ackTimeout := ackTimeoutOrDefault(opts.AckTimeout)
 	if stopRequested(stop) {
 		return ErrSendStopped
 	}
@@ -1089,7 +1081,7 @@ ackLoop:
 							return &CompatError{LocalTooOld: localTooOld, text: compatErrorMessage(localTooOld, localVer, ack.Ver,
 								MinProtocolVersion, ProtocolVersion, ack.PvMin, ack.Pv, updateHint)}
 						}
-						if ack.Ver != "" && localVer != "" && ack.Ver != localVer && (!peerVerReleaseOnly || releaseShapedVer(ack.Ver)) {
+						if ack.Ver != "" && localVer != "" && ack.Ver != localVer && (!opts.PeerVersionReleaseOnly || releaseShapedVer(ack.Ver)) {
 							fmt.Printf("  Peer version: %s\n", displayText(ack.Ver, maxDisplayVer))
 						}
 						// The receiver's promise of a final word, read by its
@@ -1151,7 +1143,7 @@ ackLoop:
 	// stop has closed, whatever it returns: its caller opens its Ctrl+C line
 	// with one, also when a refusal or a close won the race with the stop.
 	barEnded := false
-	if bar != nil && endBarLine {
+	if bar != nil && opts.EndBarLine {
 		defer func() {
 			if !barEnded && bar.IsStarted() && !stopRequested(stop) {
 				fmt.Println()

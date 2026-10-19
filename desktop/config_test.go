@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestConfigRoundTrip proves a saved address comes back verbatim, which is the
@@ -154,6 +155,79 @@ func TestSaveConfigIsAtomic(t *testing.T) {
 	}
 	if got := loadConfigFrom(path); got.Server != "https://other.example.com" {
 		t.Errorf("server = %q, want the overwritten value", got.Server)
+	}
+}
+
+// TestAtomicWritesLeaveNoTempOnAFailedRename pins the failure half of the three
+// temp-then-rename writers (desktop.json, the quit record, the update cache).
+// When the rename cannot replace the target (a folder in its place) the target
+// stays as it was and the temporary file goes. When the folder cannot be made
+// (a file in its place) or the temporary file cannot be written (a folder under
+// its name) nothing is written and that folder is left alone. In each case the
+// two writers that return an error return one.
+func TestAtomicWritesLeaveNoTempOnAFailedRename(t *testing.T) {
+	writers := []struct {
+		name  string
+		write func(path string) error
+	}{
+		{"desktop.json", func(p string) error { return saveConfigTo(p, appConfig{Server: "https://x.test", Migrated: true}) }},
+		{"quit record", func(p string) error {
+			return saveQuitDrop(p, quitDrop{At: 1, Result: RequestResult{Files: 1, Saved: 1}})
+		}},
+		{"update cache", func(p string) error { writeUpdateCache(p, "desktop-v1.0.0", time.Now()); return nil }},
+	}
+	mustFolder := func(t *testing.T, p string, keep bool) {
+		t.Helper()
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if keep {
+			if err := os.WriteFile(filepath.Join(p, "keep.txt"), []byte("kept"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, w := range writers {
+		reportsErrors := w.name != "update cache"
+		t.Run(w.name+"/rename", func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "target.json")
+			mustFolder(t, p, true)
+			if err := w.write(p); reportsErrors && err == nil {
+				t.Error("no error for a rename that failed")
+			}
+			if _, err := os.Stat(p + ".tmp"); !os.IsNotExist(err) {
+				t.Errorf("the temporary file outlived the failed rename (%v)", err)
+			}
+			if b, err := os.ReadFile(filepath.Join(p, "keep.txt")); err != nil || string(b) != "kept" {
+				t.Errorf("the target changed: %q, %v", b, err)
+			}
+		})
+		t.Run(w.name+"/write", func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "target.json")
+			mustFolder(t, p+".tmp", false)
+			if err := w.write(p); reportsErrors && err == nil {
+				t.Error("no error for a temporary file that could not be written")
+			}
+			if _, err := os.Stat(p); !os.IsNotExist(err) {
+				t.Errorf("a target was written (%v)", err)
+			}
+			if fi, err := os.Stat(p + ".tmp"); err != nil || !fi.IsDir() {
+				t.Errorf("the folder under the temporary name was touched (%v)", err)
+			}
+		})
+		t.Run(w.name+"/mkdir", func(t *testing.T) {
+			parent := filepath.Join(t.TempDir(), "floe")
+			if err := os.WriteFile(parent, []byte("a file"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			p := filepath.Join(parent, "target.json")
+			if err := w.write(p); reportsErrors && err == nil {
+				t.Error("no error for a folder that could not be made")
+			}
+			if b, err := os.ReadFile(parent); err != nil || string(b) != "a file" {
+				t.Errorf("the file in the folder's place changed: %q, %v", b, err)
+			}
+		})
 	}
 }
 
@@ -326,6 +400,29 @@ func TestResetWritesDefaults(t *testing.T) {
 	}
 	if got.ReportStats != true {
 		t.Error("reset left stats opted out; true is the shipped default and the Go zero value is the wrong answer here")
+	}
+}
+
+// TestConfigPathsAreEmptyWithoutAConfigDir: with no OS config folder to name
+// (APPDATA unset on Windows, XDG_CONFIG_HOME and HOME unset elsewhere), each of
+// the four files under floe/ resolves to "", the value every caller checks
+// before it reads or writes one.
+func TestConfigPathsAreEmptyWithoutAConfigDir(t *testing.T) {
+	for _, k := range []string{"APPDATA", "XDG_CONFIG_HOME", "HOME"} {
+		t.Setenv(k, "")
+	}
+	if _, err := os.UserConfigDir(); err == nil {
+		t.Skip("this platform names a config folder with these unset")
+	}
+	for name, p := range map[string]string{
+		"configPath":      configPath(),
+		"webviewDataPath": webviewDataPath(),
+		"quitDropPath":    quitDropPath(),
+		"updateCachePath": updateCachePath(),
+	} {
+		if p != "" {
+			t.Errorf("%s = %q with no config folder, want \"\"", name, p)
+		}
 	}
 }
 
@@ -572,5 +669,96 @@ func TestSetToastsAndSoundPersistAndKeepEverythingElse(t *testing.T) {
 	}
 	if got := a.GetSettings(); got.NoToasts || !got.SilentToasts {
 		t.Errorf("SetToasts(true) = %+v, want notifications back on and sound still off", got)
+	}
+}
+
+// TestSetCheckUpdatesPersistsAndKeepsEverythingElse drives the update-check
+// setter against the test home the same way: it writes NoUpdateCheck alone, in
+// memory and in desktop.json, and a later SetSettings carries it through.
+func TestSetCheckUpdatesPersistsAndKeepsEverythingElse(t *testing.T) {
+	a := &App{cfg: appConfig{Server: "https://x.test", HideIP: true, ReportStats: true, NoToasts: true, SilentToasts: true, Migrated: true}}
+	if err := a.SetCheckUpdates(false); err != nil {
+		t.Fatalf("SetCheckUpdates(false): %v", err)
+	}
+	want := appConfig{Server: "https://x.test", HideIP: true, ReportStats: true, NoUpdateCheck: true, NoToasts: true, SilentToasts: true, Migrated: true}
+	if got := a.GetSettings(); got != want {
+		t.Fatalf("settings after SetCheckUpdates(false) = %+v, want %+v", got, want)
+	}
+	if got := loadConfig(); got != want {
+		t.Fatalf("persisted settings = %+v, want %+v", got, want)
+	}
+	if err := a.SetSettings("https://y.test", "", false, true); err != nil {
+		t.Fatalf("SetSettings: %v", err)
+	}
+	if got := loadConfig(); !got.NoUpdateCheck || got.Server != "https://y.test" {
+		t.Errorf("a whole-record save lost the update-check choice: %+v", got)
+	}
+	if err := a.SetCheckUpdates(true); err != nil {
+		t.Fatalf("SetCheckUpdates(true): %v", err)
+	}
+	if got := a.GetSettings(); got.NoUpdateCheck || !got.NoToasts || !got.SilentToasts {
+		t.Errorf("SetCheckUpdates(true) = %+v, want checking back on and both toast choices kept", got)
+	}
+}
+
+// TestSettersKeepTheRecordWhenTheWriteFails: when desktop.json cannot be
+// written (here a file stands where its folder goes), each of the four setters
+// returns the error and leaves the record in memory as it was, so the screen
+// never shows a setting that was not saved.
+func TestSettersKeepTheRecordWhenTheWriteFails(t *testing.T) {
+	home := t.TempDir()
+	for _, k := range []string{"APPDATA", "XDG_CONFIG_HOME", "HOME"} {
+		t.Setenv(k, home)
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "floe"), []byte("not a folder"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cur := appConfig{Server: "https://x.test", ReportStats: true, Migrated: true}
+	a := &App{cfg: cur}
+	for name, set := range map[string]func() error{
+		"SetSettings":     func() error { return a.SetSettings("https://y.test", "", true, false) },
+		"SetCheckUpdates": func() error { return a.SetCheckUpdates(false) },
+		"SetToasts":       func() error { return a.SetToasts(false) },
+		"SetToastSound":   func() error { return a.SetToastSound(false) },
+	} {
+		if err := set(); err == nil {
+			t.Errorf("%s: no error for a desktop.json that could not be written", name)
+		}
+		if got := a.GetSettings(); got != cur {
+			t.Errorf("%s: the record changed to %+v without being saved", name, got)
+		}
+	}
+}
+
+// TestConcurrentSettersKeepEachOthersField: Wails runs every bound call on its
+// own goroutine and the Settings screen fires unawaited saves on quick toggle
+// flips, so two setters can run at once. Neither may write back a record read
+// before the other's write and so bring back the field the other just changed,
+// in memory or in desktop.json.
+func TestConcurrentSettersKeepEachOthersField(t *testing.T) {
+	a := &App{cfg: appConfig{ReportStats: true, Migrated: true}}
+	for i := 0; i < 50; i++ {
+		toasts, checks := i%2 == 0, i%3 == 0
+		start, errs := make(chan struct{}), make(chan error, 2)
+		go func() { <-start; errs <- a.SetToasts(toasts) }()
+		go func() { <-start; errs <- a.SetCheckUpdates(checks) }()
+		close(start)
+		for j := 0; j < 2; j++ {
+			if err := <-errs; err != nil {
+				t.Fatalf("round %d: %v", i, err)
+			}
+		}
+		for where, got := range map[string]appConfig{"in memory": a.GetSettings(), "in desktop.json": loadConfig()} {
+			if got.NoToasts != !toasts || got.NoUpdateCheck != !checks {
+				t.Fatalf("round %d, %s: NoToasts %v and NoUpdateCheck %v, want %v and %v", i, where, got.NoToasts, got.NoUpdateCheck, !toasts, !checks)
+			}
+		}
 	}
 }

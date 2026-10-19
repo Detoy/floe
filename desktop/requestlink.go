@@ -11,11 +11,13 @@ package main
 // never run under l.mu. The close guard reads l.live, an atomic, and never
 // waits on l.mu (S1-DSK-04).
 //
-// Privacy: the host token, the link, the link id and the room id live in this
-// struct only, in memory. The link reaches the screen through the snapshot's
-// Link field and nothing else; the token reaches nothing but the one join
-// frame the engine writes. None of them is logged, persisted or put in an
-// error. Every snapshot code is a key the frontend maps to fixed copy.
+// Privacy: the host token, the link, the link id and the room id live in
+// memory only: the link, which carries the link id and the room id, in this
+// struct, and the token in the lane goroutine's own variables. The link reaches
+// the screen through the snapshot's Link field and nothing else; the token
+// reaches nothing but the one join frame the engine writes. None of them is
+// logged, persisted or put in an error. Every snapshot code is a key the
+// frontend maps to fixed copy.
 //
 // RequestLinkSupport lives in serverprobe.go, with its concern (S1-DSK-02).
 // No Settings switch stands before the lane (H7 S-1): Make link is the
@@ -220,22 +222,16 @@ type requestLane struct {
 	// is the per-process counter; only ever read and bumped under mu.
 	seq uint64
 
-	// The link's secrets, in memory only; endLocked forgets them. hostToken
-	// is kept for the lane's shape (spec 06 4.2) but nothing reads it: the
-	// lane goroutine joins with its own copy. Never print the lane (a %v of
-	// it would show the token) and never copy the field into a snapshot
-	// (TestRequestSnapshotNeverCarriesToken).
-	roomID    string
-	linkID    string
-	hostToken string
-	link      string
+	// The link, in memory only; endLocked forgets it. It carries the link id
+	// and the room id, so never print the lane (a %v of it would show them).
+	// The host token is not kept here: the lane goroutine joins with its own
+	// copy, and no snapshot carries it (TestRequestSnapshotNeverCarriesToken).
+	link string
 
 	label     string // display label: trimmed, at most requestLabelMax runes
 	saveDir   string
 	expiresAt time.Time
 	server    string
-	web       string
-	hideIP    bool
 
 	// autoAccept is this link's Auto-accept switch: set by every Make link
 	// from its own argument, never read from a setting or a previous link,
@@ -391,20 +387,12 @@ func liveState(state string) bool {
 	return false
 }
 
-// liveNow reports whether a link is being made, is open, or a drop runs. It
-// reads the atomic only and never takes the lane mutex. The close guard reads
-// closeGuardNow since 0ce8486, and the one-link rule reads l.live under the
-// lane mutex, so only tests call this now. Nil-safe.
-func (l *requestLane) liveNow() bool {
-	return l != nil && l.live.Load()
-}
-
 // closeGuardNow reports whether the lane must hold a close for the Close Floe?
 // question: a link is open or a drop runs. A link still being made is not
 // one: nothing has been shared yet, closeForQuit ends the making, and the
 // question had no sentence for it, so it said "Closing Floe stops the
 // transfer" where there was none (deep QA A5-03). The one-link rule still
-// counts making (liveNow). Atomic only, like liveNow. Nil-safe.
+// counts making (l.live). Atomic only, never the lane mutex. Nil-safe.
 func (l *requestLane) closeGuardNow() bool {
 	return l != nil && l.holdsClose.Load()
 }
@@ -417,11 +405,11 @@ func (l *requestLane) setStateLocked(state, code string) {
 	l.holdsClose.Store(liveState(state) && state != "making")
 }
 
-// endLocked moves the lane to a terminal state and forgets the link's
-// secrets: the token dies with the link.
+// endLocked moves the lane to a terminal state and forgets the link; the token
+// dies with the lane goroutine this wakes.
 func (l *requestLane) endLocked(state, code string) {
 	l.setStateLocked(state, code)
-	l.hostToken, l.roomID, l.linkID, l.link = "", "", "", ""
+	l.link = ""
 	l.prompt = nil
 	l.reconnectUntil = time.Time{}
 	// A link that ended needs no goroutine: wake it, so it lets go of its
@@ -738,7 +726,7 @@ func (a *App) MakeRequestLink(label string, saveDir string, lifetime string, aut
 	}
 	// A socket an ended link's goroutine has not let go of yet is taken here
 	// and torn down below, so the new link's registration can never orphan
-	// it (finishRequestSocket leaves a socket it no longer owns alone).
+	// it (releaseRequestSocket leaves a socket it no longer owns alone).
 	leftover := l.sc
 	l.sc = nil
 	// The same for a peer connection and a drop cancel an ended drop did not
@@ -837,14 +825,11 @@ func (a *App) runRequestLink(rg uint64, stop <-chan struct{}, hideIP bool, lifet
 		if !a.requestActive(rg) {
 			return
 		}
-		switch {
-		case err != nil:
+		switch relayErr := requireRelay(true, hasRelay, degraded); {
+		case err != nil, relayErr == errRelayUnknown:
 			a.reqFail(rg, "relay-unknown")
 			return
-		case requireRelay(true, hasRelay, degraded) == errRelayUnknown:
-			a.reqFail(rg, "relay-unknown")
-			return
-		case requireRelay(true, hasRelay, degraded) == errNoRelay:
+		case relayErr == errNoRelay:
 			a.reqFail(rg, "no-relay")
 			return
 		}
@@ -869,8 +854,7 @@ func (a *App) runRequestLink(rg uint64, stop <-chan struct{}, hideIP bool, lifet
 	}
 	expiresAt := time.Now().Add(life)
 	if !a.reqUpdate(rg, func(l *requestLane) {
-		l.hostToken, l.roomID, l.linkID = hostToken, roomID, linkID
-		l.server, l.web, l.hideIP = server, web, hideIP
+		l.server = server
 		l.expiresAt = expiresAt
 	}) {
 		return
@@ -902,7 +886,9 @@ func (a *App) runRequestLink(rg uint64, stop <-chan struct{}, hideIP bool, lifet
 	for {
 		switch a.waitRequest(rg, stop, sc, expiresAt) {
 		case waitEnded:
-			a.finishRequestSocket(sc)
+			// Request-close best effort: a used-up or ended link frees its
+			// reservation now.
+			a.releaseRequestSocket(sc, true)
 			return
 		case waitDown:
 			a.releaseRequestSocket(sc, false)
@@ -1039,16 +1025,6 @@ func (a *App) waitRequest(rg uint64, stop <-chan struct{}, sc *signaling.Client,
 			}
 		}
 	}
-}
-
-// finishRequestSocket lets go of the lane goroutine's socket when its link
-// has ended. A socket still registered with the lane is the goroutine's to
-// end: request-close best effort (a used-up or ended link frees its
-// reservation now), then closed. One that Close link, a quit or a new Make
-// link already took is theirs, and it is left alone: closing it here would
-// race their request-close write and drop it (the 20x stress caught that).
-func (a *App) finishRequestSocket(sc *signaling.Client) {
-	a.releaseRequestSocket(sc, true)
 }
 
 // requestInState reports whether generation rg still owns the lane and the
@@ -1415,7 +1391,7 @@ func (a *App) openPrompt(rg uint64, p RequestPrompt) uint64 {
 		l.battery = battery
 		l.prompt = &p
 		l.setStateLocked("deciding", "")
-		quiet = l.pruneEndsLocked()
+		quiet = l.pruneEndsLocked(&l.promptEnds)
 		l.suggestClose = quiet
 	}) {
 		return 0
@@ -1435,7 +1411,7 @@ func (a *App) endPrompt(rg uint64) {
 	l.mu.Lock()
 	if rg == l.gen {
 		l.promptEnds = append(l.promptEnds, l.now())
-		l.suggestClose = l.pruneEndsLocked()
+		l.suggestClose = l.pruneEndsLocked(&l.promptEnds)
 	}
 	l.mu.Unlock()
 	a.attentionOff()
@@ -1508,18 +1484,20 @@ func (a *App) endDrop(rg uint64, state, code string, res *RequestResult) bool {
 // within it silence the toast for the next ones.
 const requestSpamWindow = 10 * time.Minute
 
-// pruneEndsLocked drops prompt ends older than the E-40 window and reports
-// whether two or more remain: then the toast stays quiet and the snapshot
-// suggests closing the link (the flash and the title still fire).
-func (l *requestLane) pruneEndsLocked() bool {
+// pruneEndsLocked drops the times in ends older than the E-40 window and
+// reports whether two or more remain. For prompt ends the toast then stays
+// quiet and the snapshot suggests closing the link (the flash and the title
+// still fire); for automatic Accepts a visitor abandoned, TO4 stays quiet
+// (onAutoAccept).
+func (l *requestLane) pruneEndsLocked(ends *[]time.Time) bool {
 	cut := l.now().Add(-requestSpamWindow)
-	kept := l.promptEnds[:0]
-	for _, t := range l.promptEnds {
+	kept := (*ends)[:0]
+	for _, t := range *ends {
 		if t.After(cut) {
 			kept = append(kept, t)
 		}
 	}
-	l.promptEnds = kept
+	*ends = kept
 	return len(kept) >= 2
 }
 
@@ -1634,15 +1612,7 @@ func (a *App) onPrompt(rg uint64, quiet bool) {
 func (a *App) onAutoAccept(rg uint64) {
 	l := a.lane()
 	l.mu.Lock()
-	cut := l.now().Add(-requestSpamWindow)
-	kept := l.autoEnds[:0]
-	for _, t := range l.autoEnds {
-		if t.After(cut) {
-			kept = append(kept, t)
-		}
-	}
-	l.autoEnds = kept
-	quiet := len(kept) >= 2
+	quiet := l.pruneEndsLocked(&l.autoEnds)
 	l.mu.Unlock()
 	if quiet {
 		return

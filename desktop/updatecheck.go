@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -199,13 +198,7 @@ func compareVersionParts(a, b string) int {
 // not live in desktop.json: that file is rewritten on every settings change
 // and is documented as the wrong home for churn data. "" disables caching but
 // never the check itself.
-func updateCachePath() string {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(dir, "floe", "desktop-update-check.json")
-}
+func updateCachePath() string { return floeConfigFile("desktop-update-check.json") }
 
 // readUpdateCache returns the cached latest tag when the entry is fresh.
 // Malformed or expired entries are misses; a torn write self-heals as a miss
@@ -231,26 +224,18 @@ func readUpdateCache(path string, now time.Time) (string, bool) {
 	return c.Latest, true
 }
 
-// writeUpdateCache stores a successful check, atomically (temp+rename, the
-// config.go idiom: this file is rewritten daily for years). Best-effort.
+// writeUpdateCache stores a successful check, atomically (temp+rename through
+// config.go's writeFileAtomic: this file is rewritten daily for years).
+// Best-effort.
 func writeUpdateCache(path, latest string, now time.Time) {
 	if path == "" {
-		return
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return
 	}
 	body, err := json.Marshal(updateCacheEntry{CheckedAt: now, Latest: latest})
 	if err != nil {
 		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o600); err != nil {
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-	}
+	_ = writeFileAtomic(path, body)
 }
 
 // releasesURL returns the endpoint to list releases from. FLOE_UPDATE_API is a

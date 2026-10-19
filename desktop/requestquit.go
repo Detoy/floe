@@ -52,33 +52,16 @@ type quitDrop struct {
 
 // quitDropPath is the record's file, beside desktop.json, or "" when the OS
 // config directory cannot be found (no record is written or read then).
-func quitDropPath() string {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(dir, "floe", "quit-drop.json")
-}
+func quitDropPath() string { return floeConfigFile("quit-drop.json") }
 
 // saveQuitDrop writes q to path through a temporary file and a rename, so a
 // process ended mid-write leaves the last whole record or none.
 func saveQuitDrop(path string, q quitDrop) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
 	body, err := json.Marshal(q)
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return writeFileAtomic(path, body)
 }
 
 // takeQuitDrop reads the record at path and removes the file, so the drop
@@ -266,13 +249,9 @@ func (r *dropRecord) stopOwedLocked() {
 // restoreQuitDrop shows the record a launch read (takeQuitDrop) as the lane's
 // state: stopped with app-closed, generation 0, the record's label and result,
 // and the time it was written as EndedAt, so History dates the row by the
-// drop, not by the launch. ok false changes nothing. The lane holds no link,
-// so the close guard and the one-link rule stay off, and Make link moves on
-// from it like from any result.
-func (l *requestLane) restoreQuitDrop(q quitDrop, ok bool) {
-	if !ok {
-		return
-	}
+// drop, not by the launch. The lane holds no link, so the close guard and the
+// one-link rule stay off, and Make link moves on from it like from any result.
+func (l *requestLane) restoreQuitDrop(q quitDrop) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	res := q.Result

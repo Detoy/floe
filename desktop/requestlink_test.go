@@ -7,6 +7,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -785,6 +786,44 @@ func TestMakeRequestLinkHideIPWithoutRelay(t *testing.T) {
 	}
 }
 
+// TestMakeRequestLinkHideIPNeedsAKnownRelay: with Hide my IP on, Make link ends
+// before any join when the relay probe cannot vouch for a relay: relay-unknown
+// when the probe failed or the list fell back to STUN, no-relay when the server
+// answered with none. The probe and the request-1 check are seams here, so no
+// server is asked.
+func TestMakeRequestLinkHideIPNeedsAKnownRelay(t *testing.T) {
+	for _, c := range []struct {
+		name               string
+		hasRelay, degraded bool
+		err                error
+		want               string
+	}{
+		{"probe failed", false, false, errors.New("the probe failed"), "relay-unknown"},
+		{"stun fallback", false, true, nil, "relay-unknown"},
+		{"no relay", false, false, nil, "no-relay"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			saveDir := t.TempDir()
+			a := &App{notifyFn: func(string, string) {}, wake: &wakeGuard{onBlock: func() {}, onAllow: func() {}}}
+			a.cfg = appConfig{Server: "http://127.0.0.1:9", HideIP: true}
+			l := a.lane()
+			l.emitFn = func(string, any) {}
+			l.supportFn = func(string) FeatureResult {
+				return FeatureResult{Reachable: true, RequestLinks: true, FeatureList: true}
+			}
+			l.relayFn = func(string) (bool, bool, error) { return c.hasRelay, c.degraded, c.err }
+			t.Cleanup(func() {
+				a.CloseRequestLink()
+				l.wg.Wait()
+			})
+			a.MakeRequestLink("x", saveDir, "24h", false)
+			if s := waitState(t, a, 10*time.Second, "error"); s.Code != c.want {
+				t.Fatalf("code %q, want %q", s.Code, c.want)
+			}
+		})
+	}
+}
+
 func TestRequestJoinRefusalCodesMapToSnapshot(t *testing.T) {
 	// Through the fake server.
 	for _, c := range []struct{ refuse, want string }{
@@ -1304,7 +1343,7 @@ func TestLinkShapeAndDerivedRoomID(t *testing.T) {
 func TestSanitizeRequestLabel(t *testing.T) {
 	long := strings.Repeat("a", 200)
 	cases := []string{
-		`a<b>c:d"e/f\g|h?i*j`, "tab\there", "bell\x07x", "photo‮gnp", "a⁦b",
+		`a<b>c:d"e/f\g|h?i*j`, "tab\there", "bell\x07x", "photo\u202egnp", "a\u2066b",
 		"CON", "com1", "LPT9", "nul", "name...  ", "  ", "", ".", "..", long, "Acme footage",
 	}
 	for _, in := range cases {
@@ -1456,7 +1495,7 @@ func TestRequestWakeAcquiredOnAcceptReleasedOnEnd(t *testing.T) {
 			if requestHeld(w) || *allows != 1 {
 				t.Fatalf("%s left the request hold (allows %d)", name, *allows)
 			}
-			if a.lane().liveNow() {
+			if a.lane().live.Load() {
 				t.Fatalf("%s left the lane live", name)
 			}
 		})

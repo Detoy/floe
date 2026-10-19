@@ -55,6 +55,7 @@ import {reloadGate} from '@/lib/reloadGate';
 import {routeLabel} from '@/lib/routeLog';
 import {createIceList, freshenWithin} from '@/lib/iceList';
 import {resolveSocketUrl} from '@/lib/socketUrl';
+import {hasDataChannelSupport} from '@/lib/request/browserSupport';
 
 import {
     Card,
@@ -304,6 +305,12 @@ export function P2PTransfer() {
     // page behind its own receiver.
     const rejoinTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const rejoinAttemptRef = useRef(0);
+    // Set on mount in a browser with no WebRTC. Its sentence in the banner is
+    // then the page's whole account, and only the person closing the banner
+    // may take it down: a reconnect cleared it, a refusal wrote its own banner
+    // over it that the admitted retry then cleared, and a receiver's arrival
+    // cleared the sending page's, each leaving no reason on screen.
+    const noWebRtcRef = useRef(false);
     const clearRejoin = () => {
         if (rejoinTimerRef.current) clearTimeout(rejoinTimerRef.current);
         rejoinTimerRef.current = null;
@@ -425,6 +432,7 @@ export function P2PTransfer() {
             }
         },
         onConnectError: (err) => {
+            if (noWebRtcRef.current) return;
             if (err.message === 'Rate limit exceeded') {
                 setError(withRefusalBanner);
             }
@@ -434,8 +442,11 @@ export function P2PTransfer() {
         onConnect: () => setError(withoutRefusalBanner),
         onReconnect: () => {
             // Cleared, except the Link Invalid card of a page that has no
-            // room to re-join: see afterReconnect.
-            setError((prev) => afterReconnect(prev, joinedRoomRef.current !== null));
+            // room to re-join: see afterReconnect. A page without WebRTC keeps
+            // its sentence (noWebRtcRef).
+            if (!noWebRtcRef.current) {
+                setError((prev) => afterReconnect(prev, joinedRoomRef.current !== null));
+            }
             // A new socket is a new attempt at the room: the join below is the
             // only one in flight, and a refusal starts the schedule again.
             clearRejoin();
@@ -907,6 +918,12 @@ export function P2PTransfer() {
         // no-op (rejoinAsReceiver).
         unmountedRef.current = false;
         const roomFromUrl = getRoomFromUrl(window.location.hash, window.location.search);
+        // Tor Browser, Mullvad Browser and Firefox with
+        // media.peerconnection.enabled off have no data channels, and new
+        // SimplePeer throws there. A receiver used to emit join-room first, so
+        // it held the room's seat with no peer while the sender waited.
+        const webRtc = hasDataChannelSupport(window);
+        noWebRtcRef.current = !webRtc;
 
         if (roomFromUrl) {
             if (!isValidRoomId(roomFromUrl)) {
@@ -921,6 +938,14 @@ export function P2PTransfer() {
                 setStatus('Access Denied');
                 return;
             }
+            // No join, so the seat stays free for a browser that can take it,
+            // and the attempt is over before it starts: the banner is the whole
+            // account, with no joining steps under it.
+            if (!webRtc) {
+                setError('This browser cannot receive files through Floe because WebRTC is missing or turned off. Open the link in a current version of Chrome, Edge, Firefox or Safari.');
+                setReceiveEnded(true);
+                return;
+            }
             // The credentials fetch is a round trip, and unmounting during it
             // used to leave the .then to build a SimplePeer, register
             // onRoomFull, emit join-room and assign peerRef, with no cleanup
@@ -931,6 +956,10 @@ export function P2PTransfer() {
                 joinRoomAsReceiver(roomFromUrl);
             });
         } else {
+            // Said on load, before a link goes out that this page cannot serve.
+            if (!webRtc) {
+                setError('This browser cannot send files through Floe because WebRTC is missing or turned off. Use a current version of Chrome, Edge, Firefox or Safari.');
+            }
             void iceList.read();
         }
 
@@ -1120,7 +1149,9 @@ export function P2PTransfer() {
             // also hid the next failure's own message.
             setTransferSpeed('');
             setEstimatedTime('');
-            setError('');
+            // Except a page without WebRTC's sentence, which is still why this
+            // send cannot start (noWebRtcRef).
+            if (!noWebRtcRef.current) setError('');
             setStatus('Peer joined. Starting transfer');
             requestWakeLock();
 

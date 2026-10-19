@@ -560,6 +560,19 @@ describe('handleJoinRoom', () => {
         handleJoinRoom(p, null);
         assert.equal(p.msgs[0].type, 'error');
     });
+
+    it('a peer that joins another room leaves its old one, and its partner keeps the seat', () => {
+        const other = '11111111-2222-4333-8444-555555555555';
+        const pA = makePeer('peer-A');
+        const pB = makePeer('peer-B');
+        handleJoinRoom(pA, ROOM_ID);
+        handleJoinRoom(pB, ROOM_ID);
+        handleJoinRoom(pB, other);
+        assert.deepEqual(rooms.get(ROOM_ID), [pA]);
+        assert.equal(pA.roomId, ROOM_ID);
+        assert.deepEqual(rooms.get(other), [pB]);
+        assert.equal(pB.roomId, other);
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -1873,6 +1886,33 @@ describe('checkRateLimit', () => {
         now = 61000;
         for (let c = 0; c < 20; c++) {
             assert.equal(checkRateLimit('203.0.113.9'), true, `straggler ${c + 1} after the window`);
+        }
+    });
+});
+
+// ---------------------------------------------------------------------------
+// cleanupTick: the five limiter windows
+// ---------------------------------------------------------------------------
+
+describe('cleanupTick limiter windows', () => {
+    it('drops every timestamp past its 60 s window, and an entry once none is left', () => {
+        // turn.js's map is read from turn.js itself, as turn-fallback.test.js does:
+        // server.js keeps it for its own sweep and does not export it.
+        const { turnRateLimits } = require('./turn');
+        const maps = { connectionCounts, turnRateLimits, statsRateLimits, codeRateLimits, codeFailures };
+        const now = 10_000_000;
+        for (const map of Object.values(maps)) {
+            map.clear();
+            map.set('stale', [now - 120_000, now - 60_000]);
+            map.set('mixed', [now - 90_000, now - 1_000]);
+            map.set('fresh', [now - 59_999]);
+        }
+        cleanupTick(now);
+        for (const [name, map] of Object.entries(maps)) {
+            assert.equal(map.has('stale'), false, `${name} kept an entry with nothing inside the window`);
+            assert.deepEqual(map.get('mixed'), [now - 1_000], `${name} kept a timestamp past the window`);
+            assert.deepEqual(map.get('fresh'), [now - 59_999], `${name} dropped a timestamp inside the window`);
+            map.clear();
         }
     });
 });

@@ -67,9 +67,18 @@ function getClientIp(xffHeader, socketAddr) {
     return hops[idx] || socketAddr || 'unknown';
 }
 
-// A room id must be a UUID. handleJoinRoom and POST /api/code both check it,
-// and client/lib/roomLink.ts mirrors the pattern, so keep the two in step.
+// A room id must be a UUID. Every socket join (rejectBadRoomId below) and POST
+// /api/code check it, and client/lib/roomLink.ts mirrors the pattern, so keep
+// the two in step.
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// The first check of each socket join: anything but a UUID string is answered
+// 'Invalid room ID' and goes no further.
+function rejectBadRoomId(peer, roomId) {
+    if (typeof roomId === 'string' && UUID_REGEX.test(roomId)) return false;
+    peer.send('error', { message: 'Invalid room ID' });
+    return true;
+}
 
 const allowedOrigins = [
     // One trailing slash dropped: a browser's Origin never ends with one, so
@@ -347,7 +356,7 @@ function registerCodeHandler(req, res) {
     }
     // A request room is seated by its host token and request-join, never by a
     // code, so no phrase may ever alias one. Same answer as a malformed id.
-    const reserved = typeof roomId === 'string' ? roomMeta.get(roomId.toLowerCase()) : undefined;
+    const reserved = roomMeta.get(roomId.toLowerCase());
     if (reserved && reserved.kind === 'request') {
         return res.status(400).json({ error: 'Invalid room ID' });
     }
@@ -494,39 +503,30 @@ function releaseSocket(key) {
     else openSocketsByKey.delete(key);
 }
 
-// Periodic cleanup of old rate limit entries and expired codes
+// One limiter map's sweep: the timestamps past its window go, and an entry
+// with none left goes with them.
+function sweepWindow(map, windowMs, now) {
+    for (const [key, timestamps] of map) {
+        const valid = timestamps.filter(t => now - t < windowMs);
+        if (valid.length === 0) map.delete(key);
+        else map.set(key, valid);
+    }
+}
+
+// The 60 s sweep: the limiter windows, expired codes, the policy file, request
+// reservations, the create log and ended links.
 function cleanupTick(now = Date.now()) {
-    for (const [ip, timestamps] of connectionCounts.entries()) {
-        const valid = timestamps.filter(t => now - t < RATE_LIMIT_WINDOW);
-        if (valid.length === 0) connectionCounts.delete(ip);
-        else connectionCounts.set(ip, valid);
-    }
-    for (const [ip, timestamps] of turnRateLimits.entries()) {
-        const valid = timestamps.filter(t => now - t < TURN_RATE_WINDOW);
-        if (valid.length === 0) turnRateLimits.delete(ip);
-        else turnRateLimits.set(ip, valid);
-    }
-    for (const [ip, timestamps] of statsRateLimits.entries()) {
-        const valid = timestamps.filter(t => now - t < STATS_RATE_WINDOW);
-        if (valid.length === 0) statsRateLimits.delete(ip);
-        else statsRateLimits.set(ip, valid);
-    }
-    for (const [ip, timestamps] of codeRateLimits.entries()) {
-        const valid = timestamps.filter(t => now - t < CODE_RATE_WINDOW);
-        if (valid.length === 0) codeRateLimits.delete(ip);
-        else codeRateLimits.set(ip, valid);
-    }
-    for (const [key, timestamps] of codeFailures.entries()) {
-        const valid = timestamps.filter(t => now - t < CODE_RATE_WINDOW);
-        if (valid.length === 0) codeFailures.delete(key);
-        else codeFailures.set(key, valid);
-    }
+    sweepWindow(connectionCounts, RATE_LIMIT_WINDOW, now);
+    sweepWindow(turnRateLimits, TURN_RATE_WINDOW, now);
+    sweepWindow(statsRateLimits, STATS_RATE_WINDOW, now);
+    sweepWindow(codeRateLimits, CODE_RATE_WINDOW, now);
+    sweepWindow(codeFailures, CODE_RATE_WINDOW, now);
     // dropCode, not codeToRoom.delete: the reverse index has to go in step.
     for (const [code, entry] of codeToRoom.entries()) {
         if (now > entry.expires) dropCode(code, entry.roomId);
     }
-    // Last, and in its own try/catch: a throw inside a setInterval callback
-    // reaches the process backstop (crashguard.test.js fails on that line).
+    // In its own try/catch: a throw inside a setInterval callback reaches the
+    // process backstop (crashguard.test.js fails on that line).
     try { policyStore.reload(); } catch { /* keep the last good policy */ }
     // A reservation ends here when its host has been gone for longer than the
     // grace, so the effective grace is 10 to 11 minutes (exactly 10 on a
@@ -570,7 +570,7 @@ const cleanupInterval = setInterval(() => cleanupTick(), 60000).unref();
 //
 // Both Socket.IO (browser) and WebSocket (CLI and Floe Desktop) peers share this registry.
 // Each "peer" is a plain object with:
-//   { id, type, key, roomId, send(type, data) }
+//   { id, key, roomId, send(type, data) }
 // where key is the rateKey of the address the connection was admitted under.
 //
 // This means a browser and a CLI can be in the same room and exchange
@@ -961,7 +961,7 @@ function leaveRequestRoom(peer, meta, now = Date.now()) {
     peer.roomId = null;
 }
 
-// The leave-first step of a join, for the request handlers.
+// The leave-first step of every join.
 function leaveCurrentRoom(peer, now = Date.now()) {
     if (!peer.roomId) return;
     const current = roomMeta.get(peer.roomId);
@@ -1078,10 +1078,7 @@ function recordSeating(meta, now) {
 // host's address is seated.
 function handleRequestJoin(peer, roomId, now = Date.now()) {
     if (!requestJoinAllowed(peer, now)) return;
-    if (typeof roomId !== 'string' || !UUID_REGEX.test(roomId)) {
-        peer.send('error', { message: 'Invalid room ID' });
-        return;
-    }
+    if (rejectBadRoomId(peer, roomId)) return;
     if (!policyStore.requestLinks()) {
         peer.send('disabled', {});
         return;
@@ -1208,10 +1205,7 @@ function handleRequestControl(peer, type, roomId, now = Date.now()) {
 // is created. Replies are server constants only. endsIn, the link's remaining
 // life, is read only by a create (linkEndsAt); a reclaim keeps the end it has.
 function handleHostJoin(peer, roomId, hostToken, now = Date.now(), endsIn = undefined) {
-    if (typeof roomId !== 'string' || !UUID_REGEX.test(roomId)) {
-        peer.send('error', { message: 'Invalid room ID' });
-        return;
-    }
+    if (rejectBadRoomId(peer, roomId)) return;
     if (typeof hostToken !== 'string' || !HOST_TOKEN_REGEX.test(hostToken)) {
         peer.send('error', { message: 'Invalid host token' });
         return;
@@ -1398,7 +1392,6 @@ function sioSendBacklogOver(socket) {
 function createSocketIOPeer(socket, key) {
     return {
         id: socket.id,
-        type: 'socketio',
         key,
         roomId: null,
         send(type, data) {
@@ -1443,7 +1436,6 @@ const WS_SEND_BUFFER_CEILING = 1e6;
 function createWSPeer(ws, key) {
     return {
         id: ws.peerId,
-        type: 'ws',
         key,
         roomId: null,
         send(type, data) {
@@ -1473,10 +1465,7 @@ function createWSPeer(ws, key) {
 }
 
 function handleJoinRoom(peer, roomId) {
-    if (!roomId || typeof roomId !== 'string' || !UUID_REGEX.test(roomId)) {
-        peer.send('error', { message: 'Invalid room ID' });
-        return;
-    }
+    if (rejectBadRoomId(peer, roomId)) return;
 
     // Never seat by join order in a request room, host present or in grace:
     // without this, a plain join-room into a reservation whose room array is
@@ -1489,24 +1478,10 @@ function handleJoinRoom(peer, roomId) {
         return;
     }
 
-    // A request-room member leaves through the request rules (a host's
-    // departure starts the grace); that clears peer.roomId, so the ordinary
-    // block below is skipped.
-    if (peer.roomId) {
-        const current = roomMeta.get(peer.roomId);
-        if (current && current.kind === 'request') leaveRequestRoom(peer, current);
-    }
-
-    // If already in a room, leave it first
-    if (peer.roomId) {
-        const oldRoom = rooms.get(peer.roomId);
-        if (oldRoom) {
-            const remaining = oldRoom.filter(p => p.id !== peer.id);
-            if (remaining.length === 0) destroyRoom(peer.roomId);
-            else rooms.set(peer.roomId, remaining);
-        }
-        peer.roomId = null;
-    }
+    // If already in a room, leave it first, a request-room member through the
+    // request rules (a host's departure starts the grace). Here, before the
+    // seal and the full-room refusals below; the request handlers leave last.
+    leaveCurrentRoom(peer);
 
     // The seal. Once two distinct keys have routed signals in a room, a third
     // key is refused for as long as the room exists, so a stranger holding the
@@ -2009,8 +1984,6 @@ function handlePong(ws, data) {
 
 const heartbeat = setInterval(() => heartbeatTick(wss.clients), HEARTBEAT_MS).unref();
 
-wss.on('close', () => clearInterval(heartbeat));
-
 // ---------------------------------------------------------------------------
 // Graceful shutdown (SIGTERM from platform, SIGINT from Ctrl-C)
 // ---------------------------------------------------------------------------
@@ -2102,7 +2075,6 @@ module.exports = {
     connectionCounts,
     openSocketsByKey,
     MAX_SOCKETS_PER_IP,
-    turnRateLimits,
     validateReportBytes,
     statsRateLimits,
     makeRateLimiter,
@@ -2114,7 +2086,6 @@ module.exports = {
     cleanupTick,
     applyPolicyChange,
     handleHostJoin,
-    reclaimHostSeat,
     endReservation,
     createsInWindow,
     countRequestRooms,

@@ -1,12 +1,12 @@
 'use strict';
 
 // The files a self-hoster installs from, read as text: docker-compose.yml and
-// its .env example, server/.env.example, and the two Unraid templates. Nothing
-// here runs Docker or Unraid. Each test pins one way these files have shipped
-// a stack that loads and never connects, or a setting that could not take
-// effect, and each of those passed every other check in the repository: the
-// server's own tests never read these files, and `docker compose config`
-// accepts a default that points at the wrong port.
+// its .env example, server/.env.example, the two Unraid templates and the
+// coturn example. Nothing here runs Docker, Unraid or coturn. Each test pins
+// one way these files have shipped a stack that loads and never connects, or a
+// setting that could not take effect, and each of those passed every other
+// check in the repository: the server's own tests never read these files, and
+// `docker compose config` accepts a default that points at the wrong port.
 //
 // It lives in server/ because these files are how the server's settings reach
 // it, and because `npm test` here is the suite every change to them runs.
@@ -24,6 +24,7 @@ const DOCKER_ENV_EXAMPLE = read('.env.docker.example');
 const SERVER_ENV_EXAMPLE = read('server/.env.example');
 const UNRAID_SERVER = read('unraid/floe-server.xml');
 const UNRAID_CLIENT = read('unraid/floe-client.xml');
+const COTURN_EXAMPLE = read('coturn/turnserver.conf.example');
 
 // ---------------------------------------------------------------------------
 // Readers
@@ -358,5 +359,61 @@ describe('Unraid templates', () => {
             assert.equal(field.value, '', `${name} ships a value`);
         }
         assert.equal(byTarget(serverConfigs, 'TURN_SECRET').Mask, 'true');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// coturn/turnserver.conf.example
+// ---------------------------------------------------------------------------
+
+describe('coturn/turnserver.conf.example', () => {
+    const lines = COTURN_EXAMPLE.split('\n').map((line) => line.trim());
+    const active = lines.filter((line) => line && !line.startsWith('#'));
+
+    it('refuses to relay to private, loopback, link-local and multicast addresses', () => {
+        // The relay runs with host networking and anyone under the TURN limit
+        // is handed credentials, so without these lines it is a path into the
+        // network it runs on.
+        assert.ok(active.includes('no-multicast-peers'), 'no-multicast-peers is not set');
+        // The whole standard list (Synapse's coturn guide, line for line), and
+        // nothing else, so dropping any one range fails.
+        const expected = [
+            '0.0.0.0-0.255.255.255',
+            '10.0.0.0-10.255.255.255',
+            '100.64.0.0-100.127.255.255',
+            '127.0.0.0-127.255.255.255',
+            '169.254.0.0-169.254.255.255',
+            '172.16.0.0-172.31.255.255',
+            '192.0.0.0-192.0.0.255',
+            '192.0.2.0-192.0.2.255',
+            '192.88.99.0-192.88.99.255',
+            '192.168.0.0-192.168.255.255',
+            '198.18.0.0-198.19.255.255',
+            '198.51.100.0-198.51.100.255',
+            '203.0.113.0-203.0.113.255',
+            '240.0.0.0-255.255.255.255',
+            '::1',
+            '64:ff9b::-64:ff9b::ffff:ffff',
+            '::ffff:0.0.0.0-::ffff:255.255.255.255',
+            '100::-100::ffff:ffff:ffff:ffff',
+            '2001::-2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff',
+            '2002::-2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+            'fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+            'fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+        ];
+        const denied = active
+            .filter((line) => line.startsWith('denied-peer-ip='))
+            .map((line) => line.slice('denied-peer-ip='.length));
+        for (const range of expected) {
+            assert.ok(denied.includes(range), `denied-peer-ip=${range} is not set`);
+        }
+        assert.deepEqual([...denied].sort(), [...expected].sort(), 'a denied-peer-ip line outside the standard list');
+    });
+
+    it('ships the exception for a relay on a private network commented out', () => {
+        // allowed-peer-ip wins over denied-peer-ip, so an active one reopens
+        // whatever range it names on every install.
+        assert.ok(!active.some((line) => line.startsWith('allowed-peer-ip')), 'allowed-peer-ip is active');
+        assert.ok(lines.some((line) => /^#\s*allowed-peer-ip=/.test(line)), 'the commented allowed-peer-ip example is gone');
     });
 });

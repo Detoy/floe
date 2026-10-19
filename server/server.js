@@ -46,6 +46,15 @@ const PROXY_COUNT_UNSET_LINE = process.env.TRUSTED_PROXY_COUNT
     : `TRUSTED_PROXY_COUNT is not set, so the default of ${TRUSTED_PROXY_COUNT} is in use. ` +
       'Set it to the number of reverse proxies in front of this server, or 0 if there are none.';
 
+// Logged once at startup when a value was given that cannot be a count, a word
+// or a negative number. parseInt reads it as NaN or below 0, which trusts no
+// proxy, so behind one every visitor shares the proxy's address. Never the
+// value: an operator can paste a secret into the wrong field.
+const PROXY_COUNT_INVALID_LINE = process.env.TRUSTED_PROXY_COUNT && !(TRUSTED_PROXY_COUNT >= 0)
+    ? 'TRUSTED_PROXY_COUNT is not a whole number, so the default of 0 is in use. ' +
+      'Set it to the number of reverse proxies in front of this server, or 0 if there are none.'
+    : null;
+
 // Extract the real client IP from an X-Forwarded-For header, discarding
 // client-supplied spoofed entries by only trusting the rightmost N hops.
 function getClientIp(xffHeader, socketAddr) {
@@ -63,7 +72,10 @@ function getClientIp(xffHeader, socketAddr) {
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const allowedOrigins = [
-    process.env.CLIENT_URL,
+    // One trailing slash dropped: a browser's Origin never ends with one, so
+    // an address copied from the location bar (https://app.example.com/)
+    // matched nothing and refused the operator's own web app.
+    process.env.CLIENT_URL && process.env.CLIENT_URL.replace(/\/$/, ''),
     'https://www.floe.one',
     'https://floe.one',
     'http://localhost:3000',
@@ -1994,6 +2006,7 @@ if (require.main === module) {
     });
 
     if (PROXY_COUNT_UNSET_LINE) console.warn(PROXY_COUNT_UNSET_LINE);
+    if (PROXY_COUNT_INVALID_LINE) console.warn(PROXY_COUNT_INVALID_LINE);
 
     server.listen(PORT, () => server.off('error', failFastOnBindError));
     initStats().catch(() => {}); // seed cachedTotal from Redis on startup

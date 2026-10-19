@@ -1714,10 +1714,75 @@ test('a server started without TRUSTED_PROXY_COUNT says once which count is in u
 test('a server given a TRUSTED_PROXY_COUNT says nothing about it', async (t) => {
     // 0 is what Compose, the Unraid template and server/.env.example pass; 1
     // and 2 are a deployment behind one proxy, or behind a proxy and a CDN.
-    for (const count of ['0', '1', '2']) {
+    // 1.5 is read up to its first other character, as 1, and gets no line,
+    // as the configuration page says.
+    for (const count of ['0', '1', '2', '1.5']) {
         const srv = await startServer({ TRUSTED_PROXY_COUNT: count });
         t.after(() => srv.stop());
         await assertSurvived(srv, `a start with TRUSTED_PROXY_COUNT=${count}`);
         assert.deepEqual(proxyCountLines(srv), [], `TRUSTED_PROXY_COUNT=${count}`);
     }
+});
+
+// Whole, like the line above: a value that cannot be a count acts as 0.
+const PROXY_COUNT_INVALID_LINE =
+    'TRUSTED_PROXY_COUNT is not a whole number, so the default of 0 is in use. ' +
+    'Set it to the number of reverse proxies in front of this server, or 0 if there are none.';
+
+test('a server given a TRUSTED_PROXY_COUNT that cannot be a count says once that 0 is in use', async (t) => {
+    // A word and a negative number: parseInt reads them as NaN and -1, and
+    // both trust no proxy. The value itself never reaches the log.
+    for (const value of ['two', '-1']) {
+        const srv = await startServer({ TRUSTED_PROXY_COUNT: value });
+        t.after(() => srv.stop());
+        await assertSurvived(srv, `a start with TRUSTED_PROXY_COUNT=${value}`);
+        assert.deepEqual(proxyCountLines(srv), [PROXY_COUNT_INVALID_LINE], `TRUSTED_PROXY_COUNT=${value}`);
+        assertLogsCarryNone(srv, [value], `TRUSTED_PROXY_COUNT=${value}`);
+    }
+});
+
+test('a TRUSTED_PROXY_COUNT that cannot be a count trusts no proxy', async (t) => {
+    // What "0 is in use" promises: X-Forwarded-For is ignored, so two
+    // connections naming different addresses through it share the one place
+    // MAX_CONNECTIONS_PER_IP=1 leaves the socket's own address.
+    const srv = await startServer({ TRUSTED_PROXY_COUNT: 'two', MAX_CONNECTIONS_PER_IP: '1' });
+    t.after(() => srv.stop());
+    await openAs(srv, '198.51.100.1');
+    const second = track(new WebSocket(`ws://127.0.0.1:${srv.port}/ws`, { headers: { 'X-Forwarded-For': '198.51.100.2' } }));
+    const closedWith = await new Promise((resolve, reject) => {
+        second.once('close', (code) => resolve(code));
+        second.once('error', reject);
+    });
+    assert.equal(closedWith, 1008);
+    await assertSurvived(srv, 'two connections under a TRUSTED_PROXY_COUNT that cannot be a count');
+});
+
+// --- CLIENT_URL -----------------------------------------------------------------
+
+test('a CLIENT_URL written with a trailing slash still lets its own web app in', async (t) => {
+    // A browser's Origin never ends with a slash, so an address copied from the
+    // location bar used to match nothing: the operator's own page got a 403
+    // over HTTP, and a refused /ws on a host name of its own.
+    const srv = await startServer({ CLIENT_URL: 'https://app.example.test/' });
+    t.after(() => srv.stop());
+
+    const answer = await get(srv, '/health', { Origin: 'https://app.example.test' });
+    assert.equal(answer.status, 200, "the web app's own origin was refused over HTTP");
+
+    // The two-hostname layout: the page on app., the server on api., so the
+    // same-host rule cannot let it in and only CLIENT_URL can.
+    const upgrade = await rawUpgrade(srv, '/ws', 'Origin: https://app.example.test\r\n', 'api.example.test');
+    assert.match(upgrade.head, /^HTTP\/1\.1 101 /, `the web app's own origin was refused on /ws: ${upgrade.head.split('\r\n')[0]}`);
+    upgrade.socket.destroy();
+
+    // Socket.IO, the browser's own path: its polling handshake, on the same
+    // two host names, goes through allowRequest.
+    const handshake = await get(srv, '/socket.io/?EIO=4&transport=polling', {
+        Origin: 'https://app.example.test',
+        Host: 'api.example.test',
+    });
+    assert.equal(handshake.status, 200, "the web app's own origin was refused on Socket.IO");
+    assert.match(handshake.body, /"sid"/);
+
+    await assertSurvived(srv, 'a CLIENT_URL with a trailing slash');
 });

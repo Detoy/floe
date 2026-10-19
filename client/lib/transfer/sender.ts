@@ -1,5 +1,4 @@
 // Floe sender engine — framework-agnostic, no React or simple-peer imports.
-// Extracted from P2PTransfer.tsx sendAllFiles/sendSingleFile.
 import {
     incompatibleMessage,
     HIGH_WATER,
@@ -393,6 +392,14 @@ async function sendSingleFile(
     // person watching and the receiver writing it never see two different
     // things. Identical to file.name for every caller that picks flat files.
     const wireName = entry.relativePath ?? file.name;
+    const unreadable = () => {
+        cb.onError?.(
+            `Could not read "${wireName}". It may have been moved, renamed, ` +
+            `or on a drive or folder that is no longer available. Nothing further was sent.`
+        );
+        cb.onFailed?.({ kind: 'unreadable', index });
+        return false;
+    };
 
     if (destroyed()) return true;
 
@@ -416,12 +423,7 @@ async function sendSingleFile(
         try {
             await file.arrayBuffer();
         } catch {
-            cb.onError?.(
-                `Could not read "${wireName}". It may have been moved, renamed, ` +
-                `or on a drive or folder that is no longer available. Nothing further was sent.`
-            );
-            cb.onFailed?.({ kind: 'unreadable', index });
-            return false;
+            return unreadable();
         }
         if (destroyed()) return true;
         if (session.reportStop()) return false;
@@ -584,12 +586,7 @@ async function sendSingleFile(
             // transfer, which is what this function already documents itself
             // as doing. No retry: a file that is genuinely gone will not come
             // back on a second read.
-            cb.onError?.(
-                `Could not read "${wireName}". It may have been moved, renamed, ` +
-                `or on a drive or folder that is no longer available. Nothing further was sent.`
-            );
-            cb.onFailed?.({ kind: 'unreadable', index });
-            return false;
+            return unreadable();
         }
 
         let slabOffset = 0;

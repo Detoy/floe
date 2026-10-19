@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestEndpointsDefaults proves an untouched install still talks to Floe's own
@@ -80,6 +81,60 @@ func TestEndpointsFeedShareLinkCleanly(t *testing.T) {
 		if strings.Contains(link, "//?s=") {
 			t.Errorf("cfg %+v produced a doubled slash: %q", cfg, link)
 		}
+	}
+}
+
+// TestEndpointsWaitForASettingsWrite: runSend, receiveByCode and the request
+// lane each take one endpoints() snapshot for the whole transfer, so one that
+// starts while a new address is being written must wait for that write and use
+// the address being saved, as it did while the setters held a.mu across it.
+func TestEndpointsWaitForASettingsWrite(t *testing.T) {
+	writing, release := make(chan struct{}), make(chan struct{})
+	a := &App{saveConfigFn: func(appConfig) error {
+		close(writing)
+		<-release
+		return nil
+	}}
+	saved := make(chan error, 1)
+	go func() { saved <- a.SetSettings("https://self.test", "", false, true) }()
+	<-writing
+	got := make(chan string, 1)
+	go func() {
+		s, _ := a.endpoints()
+		got <- s
+	}()
+	early := ""
+	select {
+	case early = <-got:
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-saved; err != nil {
+		t.Fatal(err)
+	}
+	if early != "" {
+		t.Fatalf("a transfer starting during the save resolved %q, not the address being saved", early)
+	}
+	if s := <-got; s != "https://self.test" {
+		t.Fatalf("endpoints = %q after the save, want the saved address", s)
+	}
+}
+
+// TestSettingsChangePanicLeavesMuFree: Wails recovers a panic in a bound call,
+// so a settings change that panicked must not leave a.mu held, or the next
+// close would wait forever on the message pump (closeBlocked).
+func TestSettingsChangePanicLeavesMuFree(t *testing.T) {
+	a := &App{}
+	func() {
+		defer func() { _ = recover() }()
+		_ = a.saveSettings(func(appConfig) appConfig { panic("boom") })
+	}()
+	done := make(chan bool, 1)
+	go func() { done <- a.closeBlocked() }()
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("a.mu is still held after a recovered panic in a settings change: closeBlocked waits")
 	}
 }
 

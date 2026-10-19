@@ -80,6 +80,16 @@ type App struct {
 	// from the transfer goroutine, so it is guarded by mu like everything else here.
 	cfg appConfig
 
+	// cfgMu serializes the settings writers (saveSettings, endpoints.go), so mu
+	// is never held across their desktop.json write; endpoints takes it too, so
+	// a read waits for a write in flight. It is taken before mu, never while mu
+	// is held.
+	cfgMu sync.Mutex
+
+	// saveConfigFn is the test seam for the desktop.json write saveSettings
+	// makes; nil means saveConfig.
+	saveConfigFn func(appConfig) error
+
 	// notifyFn is the test seam for OS notifications; nil means the real
 	// delivery: pushFn, or pushToast when that is nil too (see notify).
 	notifyFn func(title, body string)
@@ -98,6 +108,10 @@ type App struct {
 	shuttingDown   atomic.Bool
 	quitRetryArmed atomic.Bool
 	quitRetryWait  time.Duration
+
+	// shutdownWait is the test seam for the bound on shutdown's waits (the
+	// partial files and a settings write in flight), zero meaning 5 s.
+	shutdownWait time.Duration
 
 	// req is the Request link lane (requestlink.go): its own mutex,
 	// generation and handles, never the transfer slot above. Created by
@@ -169,10 +183,31 @@ func (a *App) startup(ctx context.Context) {
 // .part files are registered, and a completed file's commit rename vacated
 // that path, so nothing that finished can be touched. Bounded, so a Close
 // that parks cannot keep the app from quitting: past 5 s the .part stays,
-// which never looks like a finished file.
+// which never looks like a finished file, and a settings write still running
+// is left to finish or not.
 func (a *App) shutdown(ctx context.Context) {
 	a.shuttingDown.Store(true) // ends the quit retry (closequit.go)
-	transfer.AbandonPartialsWithin(5 * time.Second)
+	wait := a.shutdownWait
+	if wait <= 0 {
+		wait = 5 * time.Second
+	}
+	// The close no longer waits for a settings write (closeBlocked), so one
+	// still in flight lands here, off the message pump: the window is gone.
+	// It shares the partial files' bound, so the quit takes no longer than
+	// before, and a write that never returns cannot hold it.
+	settled := make(chan struct{})
+	go func() {
+		a.cfgMu.Lock()
+		close(settled)
+		a.cfgMu.Unlock()
+	}()
+	bound := time.NewTimer(wait)
+	defer bound.Stop()
+	transfer.AbandonPartialsWithin(wait)
+	select {
+	case <-settled:
+	case <-bound.C:
+	}
 	// A text send's note, for the same reason: its goroutine's cleanup may
 	// not run before the process ends (A3-B6). A folder still open here is
 	// left to the next launch's sweep.

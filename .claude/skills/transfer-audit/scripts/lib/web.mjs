@@ -51,10 +51,10 @@
  * floe.one being down: readCheckpoint names it, and the leg stops as SKIP
  * web-checkpoint, a precondition of this machine.
  */
-import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
+import { makeRandomFile } from './fixtures.mjs';
 import { Leg, PhaseError, SafetyError, sleep } from './surfaces.mjs';
 
 export const REPORT_STATS_KEY = 'floe:report-stats';
@@ -329,6 +329,13 @@ export async function shutdown() {
 }
 
 /**
+ * The TURN credential endpoint on any origin the audit points a page at
+ * (production, a self-host, the local stack), with or without a query. The
+ * leg records the STATUS of each answer, never the body.
+ */
+export const TURN_FETCH_RE = /\/api\/turn-credentials(?:\?|$)/;
+
+/**
  * Page-side init script as source text. The relay branch exists in the
  * text only when relayOnly is true. Every data channel the page opens or
  * receives is tracked by message and by send, so bytesMoved() counts what
@@ -336,13 +343,6 @@ export async function shutdown() {
  * DTLS and SCTP handshake and are never zero on a connected peer, which
  * would trip the refusal cells' zero-byte guard on every run.
  */
-/**
- * The TURN credential endpoint on any origin the audit points a page at
- * (production, a self-host, the local stack), with or without a query. The
- * leg records the STATUS of each answer, never the body.
- */
-export const TURN_FETCH_RE = /\/api\/turn-credentials(?:\?|$)/;
-
 export function AUDIT_INIT({ relayOnly = false } = {}) {
     const force = relayOnly
         ? "            cfg.iceTransportPolicy = 'relay';\n"
@@ -1543,7 +1543,7 @@ export class WebLeg extends Leg {
         );
     }
 
-    /** Receiver: every a[download] hashed in-page (helpers.ts:85-93). */
+    /** Receiver: every a[download] hashed in-page (helpers.ts sha256OfBlobUrl). */
     async outputs() {
         if (this.role !== 'receiver' || !this.page) return [];
         const anchors = await this.page
@@ -1735,12 +1735,6 @@ export async function preflight(opts = {}) {
     return { ok: true, reason: null, detail };
 }
 
-function makeRandomFile(path, bytes) {
-    const data = randomBytes(bytes);
-    writeFileSync(path, data);
-    return createHash('sha256').update(data).digest('hex');
-}
-
 /**
  * Step-0 probe P3: a relay-forced browser sender and a plain browser
  * receiver on opts.web move a 1 MiB fixture. Returns what the audit needs
@@ -1773,7 +1767,7 @@ export async function probeRelay(opts) {
     const dir = join(evidence, 'fixture');
     mkdirSync(dir, { recursive: true });
     const fixture = join(dir, 'probe.bin');
-    const expected = makeRandomFile(fixture, sizeBytes);
+    const expected = (await makeRandomFile(fixture, sizeBytes)).sha256;
     // Two page loads: two TURN fetches and two Socket.IO connections on
     // production, paced like any cell so a probe right after a run cannot
     // push the window over the soft cap.

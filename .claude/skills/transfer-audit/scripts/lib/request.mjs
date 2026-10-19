@@ -39,6 +39,7 @@ import {
     describeError,
     recordDesktopConfig,
     runAttempt,
+    safeEvidence,
     statsProofCheck,
 } from './cell.mjs';
 import {
@@ -86,9 +87,10 @@ function dailyLimit(what) {
     );
 }
 
-// The lane states in which a link exists and can be closed (Close link),
-// and the results that stay until Make another link (requestLink.ts LINK_PHASES and
-// HOLDS).
+// The lane states in which a link exists and can be closed (Close link; the
+// desktop's LINK_PHASES in components/RequestLinkView.tsx), and the results
+// that stay until Make another link (the done and stopped phases its Result
+// view shows).
 const LINK_OPEN = new Set([
     'waiting',
     'reconnecting',
@@ -211,14 +213,6 @@ function clockOf(ctx) {
         now: c.now || Date.now,
         nap: c.nap || ctx.sleep || defaultSleep,
     };
-}
-
-function safeEvidence(x) {
-    try {
-        return x ? x.evidence() : null;
-    } catch (e) {
-        return { error: e.message, notes: [] };
-    }
 }
 
 // ------------------------------------------------------------- the host

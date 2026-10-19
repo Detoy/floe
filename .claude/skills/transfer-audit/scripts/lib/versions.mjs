@@ -18,15 +18,6 @@ export const REPO = 'jannskiee/floe';
 export const STORE_PACKAGE = 'JanCarloParedes.FloeDesktop';
 export const CLI_TAG_RE = /^v(\d+)\.(\d+)\.(\d+)$/;
 export const DESKTOP_TAG_RE = /^desktop-v(\d+)\.(\d+)\.(\d+)$/;
-export const STATUSES = Object.freeze([
-    'CURRENT',
-    'STALE',
-    'UNKNOWN',
-    'NOT_INSTALLED',
-    'PARITY',
-    'DRIFT',
-    'INFO',
-]);
 export const DRIFT_STATUSES = new Set(['STALE', 'DRIFT', 'UNKNOWN']);
 
 // ---------------------------------------------------------------------------
@@ -61,8 +52,6 @@ export function inverseIdentity(identity) {
     if (first < 1) return null;
     return `${first - 1}.${m[2]}.${m[3]}`;
 }
-
-export const productFromIdentity = inverseIdentity;
 
 /** Numeric triple of 'v3.4.5', 'desktop-v3.4.5', '3.4.5'; null otherwise. */
 export function versionTriple(v) {
@@ -109,7 +98,6 @@ export function pickLatestDesktop(releases) {
     return best;
 }
 
-/** Get-AppxPackage ... | ConvertTo-Json -> { name, version, installLocation, pfn } | null. */
 /** Numeric compare of dotted versions of any length (missing parts are 0). */
 export function compareQuad(a, b) {
     const parts = (v) =>
@@ -126,6 +114,7 @@ export function compareQuad(a, b) {
     return 0;
 }
 
+/** Get-AppxPackage ... | ConvertTo-Json -> { name, version, installLocation, pfn } | null. */
 export function parseAppx(json) {
     if (json === null || json === undefined) return null;
     let data = json;
@@ -220,12 +209,6 @@ export function commitCurrency({ deployed, main, touched }) {
     if (touched === true) return 'STALE';
     return 'UNKNOWN';
 }
-
-export const compareWebSha = (deployed, main, touched) => ({
-    current: commitCurrency({ deployed, main, touched }) === 'CURRENT',
-    deployed,
-    main,
-});
 
 /** The gating rows that carry a drift status. */
 export function gatingDrift(rows) {
@@ -364,7 +347,6 @@ export function mainSha({ gh }) {
     return gh(['api', `repos/${REPO}/commits/main`, '--jq', '.sha']).trim();
 }
 
-/** true, false, or null on a 4xx compare (unknown sha, unrelated). */
 /**
  * The compare API caps its `files` array at this many entries, with no
  * truncation flag. Measured 2026-08-30: `5dedc94...7590ddb` (119 commits)
@@ -392,7 +374,8 @@ export function treeShaFor({ gh, ref, dir }) {
  * the report actually asks (does the deployed code differ) rather than
  * whether some commit touched the path. compare stays as the fallback and
  * refuses to answer once it is at the cap, so a truncated answer can never
- * read as CURRENT.
+ * read as CURRENT. Returns true, false, or null on a 4xx compare (unknown
+ * sha, unrelated).
  */
 export function compareTouches({ gh, base, head, dir }) {
     try {
@@ -560,10 +543,7 @@ export async function collectVersions(opts = {}) {
                 : null,
             latest: latestCli,
             oracle: 'floe --version; gh release view',
-            status: (() => {
-                const s = versionStatus(onPath.version, latestCli);
-                return s === 'CURRENT' || s === 'STALE' ? s : s;
-            })(),
+            status: versionStatus(onPath.version, latestCli),
             gate: false,
             suggest:
                 versionStatus(onPath.version, latestCli) === 'STALE'

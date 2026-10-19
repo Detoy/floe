@@ -88,7 +88,6 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-    createReadStream,
     existsSync,
     mkdirSync,
     readFileSync,
@@ -110,13 +109,12 @@ import { defaultExec } from './versions.mjs';
 
 export const AUMID = 'JanCarloParedes.FloeDesktop_r1y5w9chaxnzc!FloeDesktop';
 export const PACKAGE_NAME = 'JanCarloParedes.FloeDesktop';
-export const PACKAGE_FAMILY = 'JanCarloParedes.FloeDesktop_r1y5w9chaxnzc';
 export const WINDOWS_APPS = 'C:\\Program Files\\WindowsApps\\';
 export const EXE_NAME = 'floe-desktop.exe';
 // The app `wails dev` builds and runs; it holds the same single-instance
 // lock, so the second-instance refusal counts it too (FU-26).
 export const DEV_EXE_NAME = 'floe-desktop-dev.exe';
-export const WINDOW_CLASS = 'wailsWindow'; // wails v2.16.0 window.go:81
+export const WINDOW_CLASS = 'wailsWindow'; // wails v2.17.0 window.go:81
 export const WINDOW_TITLE = 'Floe'; // desktop/main.go, the wails.Run Title option
 export const SINGLE_INSTANCE_ID = 'one.floe.desktop'; // desktop/main.go, the wails.Run SingleInstanceLock.UniqueId option
 export const WAILSDEV_URL = 'http://localhost:34115';
@@ -771,11 +769,6 @@ export function sendButtonName(n) {
 }
 
 /**
- * An XPath 1.0 string literal for an arbitrary value. XPath 1.0 has no
- * escape sequence, so a value carrying both quote characters can only be
- * written as concat() of its pieces.
- */
-/**
  * A share link the receiver can be driven with: an http(s) URL carrying a
  * `#room=` fragment. The wailsdev page's read used to hand the whole page
  * text to the web receiver, which failed as
@@ -796,6 +789,11 @@ export function isRoomLink(value) {
     );
 }
 
+/**
+ * An XPath 1.0 string literal for an arbitrary value. XPath 1.0 has no
+ * escape sequence, so a value carrying both quote characters can only be
+ * written as concat() of its pieces.
+ */
 export function xpathLiteral(value) {
     const v = String(value);
     if (!v.includes("'")) return `'${v}'`;
@@ -808,16 +806,6 @@ export function xpathLiteral(value) {
 
 export function sha256(buf) {
     return createHash('sha256').update(buf).digest('hex');
-}
-
-export function sha256File(file) {
-    return new Promise((resolve, reject) => {
-        const hash = createHash('sha256');
-        createReadStream(file)
-            .on('data', (chunk) => hash.update(chunk))
-            .on('error', reject)
-            .on('end', () => resolve(hash.digest('hex')));
-    });
 }
 
 /** %APPDATA%\floe\desktop.json (desktop/config.go configPath). */
@@ -1114,7 +1102,7 @@ export const PROBE_SENTINEL_URL = 'http://127.0.0.1:9';
 export function holdsProbeSentinel(bytes) {
     let cfg;
     try {
-        cfg = JSON.parse(String(bytes ?? '').replace(/^﻿/, '').trim() || '{}');
+        cfg = JSON.parse(String(bytes ?? '').replace(/^\uFEFF/, '').trim() || '{}');
     } catch {
         return false;
     }
@@ -2324,19 +2312,6 @@ export class UiaDriver {
         return { made: true, lifetime, autoAccept, saveDir, waitingAt };
     }
     /**
-     * B2: put the Make link form's Save to field back to what it read before
-     * this driver first set it. The frontend keeps that field between
-     * launches (App.tsx writes localStorage floe:requestSaveDir on every
-     * change, and SetValue is a change), so on the Store app, the one exe
-     * that runs on the owner's own profile, a cell would otherwise leave its
-     * run folder there for the owner to find. Called once the link is closed
-     * or its result put away (lib/request.mjs releaseHost, Store lane only):
-     * the ended view's Make another link brings the form back, then the
-     * value is set and read back. An empty `before` is the owner never
-     * having chosen a folder (INFERRED: that SetValue('') clears the field
-     * on the app; the read-back decides). Nothing was set, nothing is done.
-     */
-    /**
      * Keep what the Save to field read before this driver first set it. An
      * earlier audit's own folder is not the owner's value (isAuditFolder):
      * the field then goes back to the owner's folder as an earlier command
@@ -2354,6 +2329,19 @@ export class UiaDriver {
         this._saveToRecalled = own.recalled;
         this._saveToBefore = own.before;
     }
+    /**
+     * B2: put the Make link form's Save to field back to what it read before
+     * this driver first set it. The frontend keeps that field between
+     * launches (App.tsx writes localStorage floe:requestSaveDir on every
+     * change, and SetValue is a change), so on the Store app, the one exe
+     * that runs on the owner's own profile, a cell would otherwise leave its
+     * run folder there for the owner to find. Called once the link is closed
+     * or its result put away (lib/request.mjs releaseHost, Store lane only):
+     * the ended view's Make another link brings the form back, then the
+     * value is set and read back. An empty `before` is the owner never
+     * having chosen a folder (INFERRED: that SetValue('') clears the field
+     * on the app; the read-back decides). Nothing was set, nothing is done.
+     */
     async restoreRequestSaveDir() {
         if (this._saveToBefore === undefined)
             return {
@@ -2690,7 +2678,7 @@ export class PlaywrightDriver {
      * very button the cell exists to exercise, so neither is usable here.
      *
      * The event is delivered with window.wails.EventsNotify, which runs
-     * this page's own listeners and nothing else (Wails v2.16.0
+     * this page's own listeners and nothing else (Wails v2.17.0
      * runtime/desktop/events.js; the dev IPC calls it for every event it
      * receives, runtime/dev/main.js). Never runtime.EventsEmit: after its
      * local listeners it sends 'EE' to the dev server, whose
@@ -2855,16 +2843,6 @@ export class PlaywrightDriver {
         }
     }
     /**
-     * Back to Receive > REQUEST LINK when the page is not showing it, before
-     * a request verb clicks; returns whether it had to move. The page can
-     * leave on its own terms (another leg's files:open rebroadcast moved it
-     * to Send in the first live TA-17 run, 2026-09-24, and the release then
-     * timed out on Close link), so no verb assumes it. The view is showing
-     * when one of its state buttons is (REQUEST_VIEW_MARKS); otherwise the
-     * RECEIVE tab (the first button of that name, in the card header) and
-     * the REQUEST LINK choice, the same two clicks Make link starts with.
-     */
-    /**
      * The receive view is two sub-views behind a Code | Request link choice
      * (always, since H7), and it keeps the last one: after a request cell it
      * reopens on Request link, where neither the code field nor the receive
@@ -2899,6 +2877,16 @@ export class PlaywrightDriver {
             await nap(REQUEST_POLL_MS);
         }
     }
+    /**
+     * Back to Receive > REQUEST LINK when the page is not showing it, before
+     * a request verb clicks; returns whether it had to move. The page can
+     * leave on its own terms (another leg's files:open rebroadcast moved it
+     * to Send in the first live TA-17 run, 2026-09-24, and the release then
+     * timed out on Close link), so no verb assumes it. The view is showing
+     * when one of its state buttons is (REQUEST_VIEW_MARKS); otherwise the
+     * RECEIVE tab (the first button of that name, in the card header) and
+     * the REQUEST LINK choice, the same two clicks Make link starts with.
+     */
     async _toRequestView() {
         for (const name of REQUEST_VIEW_MARKS)
             if (await this._visible(name)) return false;
@@ -4606,7 +4594,7 @@ export class DesktopLeg extends Leg {
             );
         }
         files.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
-        for (const f of files) f.sha256 = await sha256File(f.path);
+        for (const f of files) f.sha256 = await sha256OfFile(f.path);
         return files;
     }
 

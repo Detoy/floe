@@ -12,6 +12,7 @@ import {
     existsSync,
     mkdirSync,
     readdirSync,
+    readFileSync,
     statSync,
     writeFileSync,
 } from 'node:fs';
@@ -26,7 +27,6 @@ import {
     walkOutputs,
 } from './fixtures.mjs';
 import { classifyPair } from './route.mjs';
-import { readFileSync } from 'node:fs';
 import { INFRA_KEYS, PENALIZED_KEYS, SIGNATURES, classifySignature } from './triage.mjs';
 
 export const PHASES = Object.freeze([
@@ -188,7 +188,7 @@ async function recordDoneTimeout(cell, legs, rec, outDir) {
     rec.notes.push(summary);
 }
 
-function safeEvidence(leg) {
+export function safeEvidence(leg) {
     try {
         return leg ? leg.evidence() : null;
     } catch (e) {

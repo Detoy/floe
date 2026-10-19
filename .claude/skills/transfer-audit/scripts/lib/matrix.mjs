@@ -554,10 +554,6 @@ function buildCell(id, { cliHasRelayOnly }) {
             ? NA_REASONS[reason] || SKIP_REASONS[reason] || reason
             : null,
         cost: null,
-        capabilities: {
-            sender: CAPABILITIES[sender.surface],
-            receiver: CAPABILITIES[receiver.surface],
-        },
     };
     cell.cost = cellCost(cell);
     return cell;
@@ -920,10 +916,4 @@ export function countsForExit(cell) {
     if (cell.verdict === 'SKIP' && UNCOUNTED_SKIPS.has(cell.reason))
         return false;
     return true;
-}
-
-export function describeCell(cell) {
-    const snd = `${cell.sender.letter}${cell.sender.relayOnly ? '*' : ''}`;
-    const rcv = `${cell.receiver.letter}${cell.receiver.relayOnly ? '*' : ''}`;
-    return `${cell.id} ${snd}->${rcv} ${cell.path} ${cell.receiver.input} ${cell.fixture.kind}`;
 }

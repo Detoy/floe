@@ -198,6 +198,29 @@ describe('the settings screen', () => {
         expect(screen.getByLabelText('Share link address')).toBe(web);
         expect(document.activeElement).toBe(web);
     });
+
+    // Copied lasts 1.5 s from the copy that set it, as Copy link on a request
+    // link does: a second copy inside the window keeps its own 1.5 s.
+    it('About Copy: a second copy keeps Copied for 1.5 s', async () => {
+        const user = userEvent.setup();
+        mount();
+        await settled();
+        await user.click(screen.getByRole('button', {name: 'Settings'}));
+        const copy = await screen.findByRole('button', {name: 'Copy'});
+        vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+        try {
+            await act(async () => { copy.click(); });
+            expect(copy.textContent).toBe('Copied');
+            act(() => { vi.advanceTimersByTime(1000); });
+            await act(async () => { copy.click(); });
+            act(() => { vi.advanceTimersByTime(600); });
+            expect(copy.textContent).toBe('Copied');
+            act(() => { vi.advanceTimersByTime(900); });
+            expect(copy.textContent).toBe('Copy');
+        } finally {
+            vi.useRealTimers();
+        }
+    });
 });
 
 describe('the close guard', () => {
@@ -430,6 +453,103 @@ describe('the history store', () => {
         // bytes. The store is documented as user-editable, so they were
         // recoverable right up until that ran.
         expect(localStorage.getItem('floe:history')).toBe('{not json');
+    });
+
+    // A store the origin's quota has filled: jsdom's is 5,000,000 code units
+    // (jsdom/lib/api.js), the order of Chromium's. One old receive row fills
+    // it, the state a few large folder receives leave behind, since a code
+    // receive keeps every saved name. The next persist then threw
+    // QuotaExceededError inside an effect, and with no error boundary React
+    // unmounted the root: the window went blank, its title bar and Close
+    // included.
+    const QUOTA = 5_000_000;
+    function fillStore(room: number) {
+        // App writes floe:mode = 'send' and floe:saveDir = '' at mount.
+        const mountKeys = 'floe:mode'.length + 'send'.length + 'floe:saveDir'.length;
+        const row = (name: string) => [{kind: 'recv', names: [name], count: 1, dir: 'C:\\dl', at: 1_700_000_000_000, bytes: 1}];
+        const base = 'floe:history'.length + JSON.stringify(row('')).length + mountKeys;
+        localStorage.setItem('floe:history', JSON.stringify(row('x'.repeat(QUOTA - room - base))));
+    }
+
+    it('a finished code receive keeps the window up when floe:history has no room left', async () => {
+        fillStore(40);
+        const user = userEvent.setup();
+        mount();
+        await settled();
+        await user.click(screen.getAllByRole('button', {name: 'Receive'})[0]);
+        await user.type(screen.getByPlaceholderText('amber-otter-cloud'), 'amber-otter-cloud');
+        await user.click(screen.getAllByRole('button', {name: 'Receive'}).find((b) => b.className.includes('w-full'))!);
+        expect(await screen.findByText('Saved to C:\\Users\\test\\Downloads')).toBeTruthy();
+        expect(screen.getByRole('button', {name: 'Start over'})).toBeTruthy();
+    });
+
+    it('typing a Save to folder keeps the window up when floe:saveDir has no room left', async () => {
+        fillStore(6);
+        const user = userEvent.setup();
+        mount();
+        await settled();
+        await user.click(screen.getAllByRole('button', {name: 'Receive'})[0]);
+        await user.type(screen.getByPlaceholderText('Downloads (default)'), 'D:\\Floe\\inbox');
+        expect((screen.getByPlaceholderText('Downloads (default)') as HTMLInputElement).value).toBe('D:\\Floe\\inbox');
+        expect(screen.getByRole('button', {name: 'Start over'})).toBeTruthy();
+    });
+
+    it('switching to Receive keeps the window up when floe:mode has no room left', async () => {
+        // 'receive' is three code units longer than 'send'.
+        fillStore(2);
+        const user = userEvent.setup();
+        mount();
+        await settled();
+        await user.click(screen.getAllByRole('button', {name: 'Receive'})[0]);
+        expect(screen.getByPlaceholderText('amber-otter-cloud')).toBeTruthy();
+        expect(screen.getByRole('button', {name: 'Start over'})).toBeTruthy();
+    });
+
+    // A code receive's row keeps the first 200 names, as a request row does
+    // (REQUEST_NAMES_CAP), and the real count: every name of a large folder
+    // filled the one localStorage value the whole History shares.
+    it('a 300-file code receive stores 200 names', async () => {
+        let finish!: (dir: string) => void;
+        wails.go.ReceiveByCode.mockImplementation(() => new Promise<string>((resolve) => { finish = resolve; }));
+        const user = userEvent.setup();
+        mount();
+        await settled();
+        await user.click(screen.getAllByRole('button', {name: 'Receive'})[0]);
+        await user.type(screen.getByPlaceholderText('amber-otter-cloud'), 'amber-otter-cloud');
+        await user.click(screen.getAllByRole('button', {name: 'Receive'}).find((b) => b.className.includes('w-full'))!);
+        act(() => {
+            for (let i = 1; i <= 300; i++) {
+                wails.emit('recv:progress', {fileName: `f${i}.bin`, fileIndex: i, fileCount: 300, fileBytes: 1, fileSize: 1, totalBytes: i, grandTotal: 300, savedName: `f${i}.bin`});
+            }
+        });
+        await act(async () => { finish('C:\\dl'); });
+        await waitFor(() => expect(JSON.parse(localStorage.getItem('floe:history') || '[]')).toHaveLength(1));
+        const [row] = JSON.parse(localStorage.getItem('floe:history')!);
+        expect(row.names).toHaveLength(200);
+        expect([row.names[0], row.names[199]]).toEqual(['f1.bin', 'f200.bin']);
+        expect(row.count).toBe(300);
+        // The row is still titled by the real count.
+        await user.click(screen.getByRole('button', {name: 'History'}));
+        expect(screen.getByText('300 files')).toBeTruthy();
+    });
+
+    it('an expanded stored 300-name receive row lists 200 names', async () => {
+        // A row stored before the cap still holds every name. Expanded, it
+        // shows the first 200, as a new row does, so an old 100,000-name row
+        // cannot freeze the window; the stored row itself is left alone.
+        const names = Array.from({length: 300}, (_, i) => `f${i + 1}.bin`);
+        localStorage.setItem('floe:history', JSON.stringify([
+            {kind: 'recv', names, count: 300, dir: 'C:\\dl', at: 1_700_000_000_000, bytes: 300},
+        ]));
+        const user = userEvent.setup();
+        mount();
+        await settled();
+        await user.click(screen.getByRole('button', {name: 'History'}));
+        await user.click(screen.getByText('300 files'));
+        const listed = screen.getAllByRole('listitem').filter((li) => /^f\d+\.bin$/.test(li.textContent || ''));
+        expect(listed).toHaveLength(200);
+        expect([listed[0].textContent, listed[199].textContent]).toEqual(['f1.bin', 'f200.bin']);
+        expect(JSON.parse(localStorage.getItem('floe:history')!)[0].names).toHaveLength(300);
     });
 });
 

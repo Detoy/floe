@@ -2,6 +2,7 @@ import * as Sentry from '@sentry/nextjs';
 import { failClosedHooks } from './lib/failClosed';
 import { withoutLocation } from './lib/noLocation';
 import { scrubServerErrorEvent, scrubServerTransactionEvent } from './lib/scrubUrl';
+import { DATA_COLLECTION } from './lib/sentryDataCollection';
 import { tracesSampler } from './lib/traceSampling';
 
 // Both send hooks fail closed, as in the browser. See lib/failClosed.ts.
@@ -13,8 +14,11 @@ Sentry.init(failClosedHooks({
     tracesSampler,
     debug: false,
 
-    // Scrub any room secret out of request URLs (covers old ?room= links).
-    sendDefaultPii: false,
+    // No IP address collected and transactions rather than streamed spans, as
+    // in the other two configs; the room secret is scrubbed out of request
+    // URLs below (covers old ?room= links). See lib/sentryDataCollection.ts.
+    dataCollection: DATA_COLLECTION,
+    traceLifecycle: 'static',
     // No client reports, as in the other two configs. The edge SDK has no
     // default for this today, so the line guards against one arriving.
     sendClientReports: false,

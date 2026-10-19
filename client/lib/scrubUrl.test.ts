@@ -795,8 +795,9 @@ describe('scrubSpanJson', () => {
 describe('server and edge events', () => {
     // What server-side Sentry sent for a browser on /r, captured on a
     // production build of d0f0c93 with a local sink (CP-QA F3-01 and F3-03,
-    // skeptic S2), ids replaced. sendDefaultPii false drops only the headers
-    // that carry an IP address; every other header stays, Cookie included.
+    // skeptic S2), ids replaced. The dataCollection block (what 10.x made of
+    // sendDefaultPii false) drops only the headers that carry an IP address;
+    // every other header stays, Cookie included.
     const LINK_ID = 'Ab3dE_f9-xY';
     const ROOM_ID = '6f1c2b9e-4a5d-4c3b-9f7e-2d1a0b9c8e7f';
     const TREE = () =>
@@ -958,8 +959,8 @@ describe('server and edge events', () => {
     });
 
     it('drops cookies, the body and every request field but the url, method, query string and headers', () => {
-        // sendDefaultPii false does not drop cookies in @sentry/core 10.72.0:
-        // the Cookie header stays and is parsed into request.cookies unfiltered,
+        // The dataCollection block does not drop cookies, as sendDefaultPii
+        // false did not in @sentry/core 10.72.0: the Cookie header stays and is parsed into request.cookies unfiltered,
         // and a body the scope holds is attached as request.data.
         const out = scrubServerErrorEvent({
             request: {
@@ -1099,8 +1100,11 @@ describe('server and edge events', () => {
             expect(src, file).toMatch(
                 /beforeSendTransaction\(event\) \{\s*return withoutLocation\(scrubServerTransactionEvent\(event\)\);\s*\}/
             );
-            // A whole code line, so a commented-out one fails.
-            expect(src, file).toMatch(/^\s+sendDefaultPii: false,\r?$/m);
+            // A whole code line, so a commented-out one fails. The block keeps
+            // the SDK from collecting an address (lib/sentryDataCollection.ts).
+            expect(src, file).toMatch(
+                /^\s+dataCollection: DATA_COLLECTION,\r?$/m
+            );
         }
     });
 });
@@ -1376,5 +1380,150 @@ describe('the Socket.IO session id', () => {
 
     it('is idempotent', () => {
         expect(scrubUrl(POLL_SCRUBBED)).toBe(POLL_SCRUBBED);
+    });
+});
+
+// SDK 11's fetch, XHR and server instrumentation split a request URL into the
+// OpenTelemetry url.query and url.fragment, with no leading '?' or '#'
+// (getUrlQuery and getUrlFragment in @sentry/core 11.8.0), where SDK 10 wrote
+// http.query and http.fragment with them. Without them the rule for every
+// other attribute sees no fragment and no ?room= or &sid= start in
+// "room=<id>" or "sid=<id>", and passed both through.
+describe('the OpenTelemetry URL attributes of SDK 11', () => {
+    const ROOM_ID = '6f1c2b9e-4a5d-4c3b-9f7e-2d1a0b9c8e7f';
+    const LINK_ID = 'Ab3dE_f9-xY';
+    const SID = 'u7Xk2pQ9LmN4rTaBAAAC';
+
+    it('deletes url.fragment, whatever it holds', () => {
+        for (const fragment of [
+            `room=${ROOM_ID}`,
+            ROOM_ID,
+            `#room=${ROOM_ID}`,
+            'top',
+        ]) {
+            const span = {
+                data: { 'url.fragment': fragment, 'sentry.op': 'http.client' },
+            };
+            expect(scrubSpanJson(span).data).toEqual({
+                'sentry.op': 'http.client',
+            });
+        }
+    });
+
+    it('redacts the session id and the room id in url.query, and keeps its shape', () => {
+        const span = {
+            data: {
+                'url.query': `EIO=4&transport=polling&t=PaBcDeF&sid=${SID}`,
+            },
+        };
+        expect(scrubSpanJson(span).data['url.query']).toBe(
+            'EIO=4&transport=polling&t=PaBcDeF&sid=redacted'
+        );
+        const first = { data: { 'url.query': `sid=${SID}&EIO=4` } };
+        expect(scrubSpanJson(first).data['url.query']).toBe(
+            'sid=redacted&EIO=4'
+        );
+        const legacy = { data: { 'url.query': `room=${ROOM_ID}&x=1` } };
+        expect(scrubSpanJson(legacy).data['url.query']).toBe(
+            'room=redacted&x=1'
+        );
+        // The SDK 10 shape, with its '?', comes back with it.
+        const withMark = { data: { 'url.query': `?sid=${SID}` } };
+        expect(scrubSpanJson(withMark).data['url.query']).toBe('?sid=redacted');
+        // A query that holds neither is left as it was.
+        const plain = { data: { 'url.query': '_rsc=1x2y3' } };
+        expect(scrubSpanJson(plain).data['url.query']).toBe('_rsc=1x2y3');
+    });
+
+    it('redacts the request-link id in url.path', () => {
+        const span = { data: { 'url.path': `/r/${LINK_ID}` } };
+        expect(scrubSpanJson(span).data['url.path']).toBe('/r/redacted');
+        const other = { data: { 'url.path': '/download' } };
+        expect(scrubSpanJson(other).data['url.path']).toBe('/download');
+    });
+
+    it('leaves no secret in http.target, which keeps its query', () => {
+        const span = {
+            data: {
+                'http.target': `/r/${LINK_ID}?room=${ROOM_ID}`,
+                'url.path': `/r/${LINK_ID}`,
+                'url.query': `room=${ROOM_ID}`,
+            },
+        };
+        const json = JSON.stringify(scrubSpanJson(span));
+        expect(json).not.toContain(LINK_ID);
+        expect(json).not.toContain(ROOM_ID);
+        expect(span.data['http.target']).toBe('/r/redacted?room=redacted');
+    });
+
+    it('scrubs an XHR poll as SDK 11 shapes it, in a transaction', () => {
+        const poll = `https://api.floe.one/socket.io/?EIO=4&transport=polling&t=PaBcDeF&sid=${SID}`;
+        const event = {
+            transaction: '/',
+            contexts: {
+                trace: {
+                    data: {
+                        'url.full': `https://www.floe.one/?s=n0nce#room=${ROOM_ID}`,
+                        'url.path': '/',
+                        'url.fragment': `room=${ROOM_ID}`,
+                    },
+                },
+            },
+            spans: [
+                {
+                    description: 'GET https://api.floe.one/socket.io/',
+                    data: {
+                        url: poll,
+                        'http.url': poll,
+                        'url.full': poll,
+                        'url.query': `EIO=4&transport=polling&t=PaBcDeF&sid=${SID}`,
+                        'url.fragment': '',
+                    },
+                },
+            ],
+        };
+        const json = JSON.stringify(scrubTransactionEvent(event));
+        expect(json).not.toContain(SID);
+        expect(json).not.toContain(ROOM_ID);
+        expect(event.contexts.trace.data).toEqual({
+            'url.full': 'https://www.floe.one/?s=n0nce',
+            'url.path': '/',
+        });
+    });
+});
+
+describe('breadcrumb url.query and url.fragment (SDK 11)', () => {
+    // SDK 11's Node outgoing-request breadcrumb and the edge runtime's fetch
+    // breadcrumb write url.query and url.fragment beside url, with no leading
+    // '?' or '#'. Nothing in Floe makes one today (browser breadcrumbs carry
+    // neither key, and the Next server and edge make no outgoing request), so
+    // this is for the path nobody has found yet, as on spans.
+    const ID = '0b8e7c2d-4a1f-4e6b-9c3d-5f7a2e1b8c90';
+    const crumb = () => ({
+        category: 'http',
+        data: { url: 'https://floe.one/', method: 'GET', 'url.query': `room=${ID}&s=n0nce`, 'url.fragment': `room=${ID}` },
+    });
+
+    it('the browser breadcrumb hook drops the fragment and scrubs the query, keeping its shape', () => {
+        const out = scrubBreadcrumb(crumb()) as { data: Record<string, unknown> };
+        expect(JSON.stringify(out)).not.toContain(ID);
+        expect(out.data['url.fragment']).toBeUndefined();
+        expect(String(out.data['url.query']).startsWith('?')).toBe(false);
+        expect(out.data.method).toBe('GET');
+    });
+
+    it('so do the event hooks, browser and server, errors and transactions', () => {
+        const events = [
+            scrubErrorEvent({ breadcrumbs: [crumb()] }),
+            scrubTransactionEvent({ breadcrumbs: [crumb()] }),
+            scrubServerErrorEvent({ breadcrumbs: [crumb()] }),
+            scrubServerTransactionEvent({ breadcrumbs: [crumb()] }),
+        ];
+        for (const event of events) {
+            expect(JSON.stringify(event)).not.toContain(ID);
+            const data = (event.breadcrumbs as { data: Record<string, unknown> }[])[0].data;
+            expect(data['url.fragment']).toBeUndefined();
+            expect(String(data['url.query']).startsWith('?')).toBe(false);
+        }
     });
 });

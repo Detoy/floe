@@ -92,9 +92,22 @@ export function scrubUrl(url: string | undefined | null): string | undefined {
 
 // The URL-bearing attributes the SDK writes onto spans: url.full and http.url
 // on http.client spans and on the segment span (the HttpContext integration
-// backfills url.full there from location.href), plus the http.query and
-// http.fragment the fetch and XHR instrumentation split out of a request URL.
-const URL_ATTRIBUTES = ['url.full', 'http.url', 'http.query', 'http.fragment'] as const;
+// backfills url.full there from location.href), plus the query and the
+// fragment the fetch, XHR and server instrumentation split out of a request
+// URL. SDK 10 wrote them as http.query and http.fragment, which keep their '?'
+// and '#'. SDK 11 writes the OpenTelemetry url.query and url.fragment, which
+// keep neither ("sid=<id>", "room=<id>"), so the rule for every other
+// attribute below cannot see either secret in them. url.path is the bare
+// path, /r/<linkId> included.
+const URL_ATTRIBUTES = [
+    'url.full',
+    'http.url',
+    'http.query',
+    'http.fragment',
+    'url.query',
+    'url.fragment',
+    'url.path',
+] as const;
 
 // Structural shapes for Sentry's TransactionEvent and SpanJSON, declared here
 // rather than imported so this module and its vitest never load the SDK.
@@ -241,11 +254,12 @@ function scrubRequestReferer(request: unknown): void {
 
 // Server and edge events carry what a browser event never does: the request's
 // headers and query string, and on an error from captureRequestError,
-// contexts.nextjs.request_path, the raw path and query. sendDefaultPii false
-// drops only the headers that carry an IP address. Every other header stays,
-// Cookie included, and @sentry/core 10.72.0 also parses that header into
-// request.cookies, unfiltered, and attaches any body the scope holds as
-// request.data. Next's RSC requests name the page they were made from in
+// contexts.nextjs.request_path, the raw path and query. The SDK's own filter
+// (lib/sentryDataCollection.ts) only blanks, by name, the headers, cookies and
+// query keys that can carry an address or a credential. Every other header
+// stays, and @sentry/core 11.8.0 also parses the Cookie header into
+// request.cookies and attaches any body the scope holds as request.data
+// (integrations/requestdata.js). Next's RSC requests name the page they were made from in
 // Next-Url and Next-Router-State-Tree, so from /r they name /r/<linkId>: five
 // prefetch transactions per /r view on a production build (CP-QA F3-01), and a
 // render fault on /r sent the path in request_path (F3-03). A legacy ?room=
@@ -326,9 +340,11 @@ function scrubServerRequest(event: ScrubbableServerRequest): void {
 // passes now cover them, because the two places a breadcrumb is seen hold
 // different things.
 //
-// beforeBreadcrumb (the browser) gets the breadcrumb as it is made, and
-// @sentry/browser 10.72.0 puts the page's own console arguments in its data,
-// live, before the real console call: a logged object there is the app's own
+// beforeBreadcrumb (the browser) gets the breadcrumb as it is made, and the
+// Console integration (@sentry/core 11.8.0, a browser default since 11; the
+// Breadcrumbs integration made it in 10.x) puts the page's own console
+// arguments in its data, live, before the real console call: a logged object
+// there is the app's own
 // state. Walking it took a share link in state down to its path and a deep
 // object's leaves to undefined, threw on a frozen object or a getter, and in a
 // probe left the page's React tree dead after one console.log(button) (W3
@@ -355,10 +371,7 @@ export function scrubBreadcrumb<T>(crumb: T): T {
         if (typeof c.message === 'string') c.message = scrubText(c.message);
         const data = c.data;
         if (isObject(data) && !Array.isArray(data)) {
-            for (const key of BREADCRUMB_URL_KEYS) {
-                const value = data[key];
-                if (typeof value === 'string') data[key] = scrubUrl(value);
-            }
+            scrubBreadcrumbUrls(data, data);
             const args = data.arguments;
             if (Array.isArray(args)) {
                 data.arguments = args.map((arg: unknown) => (typeof arg === 'string' ? scrubText(arg) : arg));
@@ -378,12 +391,24 @@ function scrubEventBreadcrumb(crumb: unknown): unknown {
     const data = isObject(crumb) ? crumb.data : undefined;
     const copied = isObject(out) ? out.data : undefined;
     if (isObject(data) && !Array.isArray(data) && isObject(copied) && !Array.isArray(copied)) {
-        for (const key of BREADCRUMB_URL_KEYS) {
-            const value = data[key];
-            if (typeof value === 'string') copied[key] = scrubUrl(value);
-        }
+        scrubBreadcrumbUrls(data, copied);
     }
     return out;
+}
+
+// The URLs of a breadcrumb's data, read from data and written into into (the
+// same object, or the event hook's copy): url, to and from take request.url's
+// rule, and the url.query and url.fragment that SDK 11's Node and edge request
+// breadcrumbs write beside url, with no leading '?' or '#', the span
+// attributes' rule.
+function scrubBreadcrumbUrls(data: Record<string, unknown>, into: Record<string, unknown>): void {
+    for (const key of BREADCRUMB_URL_KEYS) {
+        const value = data[key];
+        if (typeof value === 'string') into[key] = scrubUrl(value);
+    }
+    if (typeof data['url.fragment'] === 'string') delete into['url.fragment'];
+    const query = data['url.query'];
+    if (typeof query === 'string' && query !== '') into['url.query'] = scrubQueryKeepingShape(query);
 }
 
 function scrubBreadcrumbs(event: ScrubbableServerRequest): void {
@@ -535,12 +560,14 @@ function scrubAttributes(data: Record<string, unknown> | undefined): void {
     for (const key of URL_ATTRIBUTES) {
         const value = data[key];
         if (typeof value !== 'string' || value === '') continue;
-        if (key === 'http.fragment') {
+        if (key === 'http.fragment' || key === 'url.fragment') {
             // A fragment is never useful telemetry, and it is where every
             // current link keeps the room id.
             delete data[key];
         } else if (key === 'http.query') {
             data[key] = scrubQuery(value);
+        } else if (key === 'url.query') {
+            data[key] = scrubQueryKeepingShape(value);
         } else {
             data[key] = scrubUrl(value);
         }
@@ -568,4 +595,11 @@ function scrubQuery(query: string): string {
     const scrubbed = scrubUrl('/' + (query.startsWith('?') ? query : '?' + query)) ?? '';
     const i = scrubbed.indexOf('?');
     return i >= 0 ? scrubbed.slice(i) : '';
+}
+
+// url.query, scrubbed and handed back as it came: with no leading '?' when it
+// had none.
+function scrubQueryKeepingShape(query: string): string {
+    const scrubbed = scrubQuery(query);
+    return query.startsWith('?') ? scrubbed : scrubbed.replace(/^\?/, '');
 }

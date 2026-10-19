@@ -53,7 +53,9 @@ type Client struct {
 	// Signal receives raw JSON signal payloads (SDP or ICE) from the remote peer.
 	Signal chan json.RawMessage
 
-	// PeerLeft is closed/sent when the remote peer disconnects.
+	// PeerLeft receives a push, and is never closed, when the server reports
+	// the remote peer gone (peer-disconnected) and when the read loop ends
+	// (after Down closes).
 	PeerLeft chan struct{}
 
 	// RoomFull is sent when the room already has two peers.
@@ -166,7 +168,6 @@ func Connect(serverURL string, opts ...Option) (*Client, error) {
 
 	c := newClient(conn, cfg)
 
-	// The read loop runs in the background and dispatches messages to channels.
 	go c.readLoop()
 	if cfg.ping > 0 {
 		go c.pingLoop(cfg.ping)
@@ -591,6 +592,20 @@ func (c *Client) CloseCode() int {
 	}
 }
 
+// IsDown reports, without waiting, whether the socket is gone: Down has
+// closed. Down closes before the read loop's last PeerLeft push, so a reader
+// woken by PeerLeft tells with this a lost server from a peer the server
+// reported gone. A Client built without Connect has a nil Down, which reads
+// as up.
+func (c *Client) IsDown() bool {
+	select {
+	case <-c.Down:
+		return true
+	default:
+		return false
+	}
+}
+
 // pingLoop writes {"type":"ping"} every interval until Close or until the
 // read loop has ended. A failed write needs no handling here: the read loop
 // sees the same dead socket and closes Down.
@@ -627,8 +642,9 @@ func (c *Client) dispatch(raw []byte) {
 	// dropped and rejoined twice filled the buffer and then wedged this loop
 	// for good. readLoop is the only reader of the socket, so a wedge here
 	// silently stops trickle ICE and the transfer dies at the 30s connect
-	// timeout with nothing to diagnose from.
-	case "room-joined":
+	// timeout with nothing to diagnose from. A request-joined carries the
+	// visitor's role the way room-joined carries the others.
+	case "room-joined", "request-joined":
 		select {
 		case c.Role <- msg.Role:
 		default:
@@ -667,15 +683,8 @@ func (c *Client) dispatch(raw []byte) {
 		default:
 		}
 
-	// The reserved-room answers (spec 04 5.5). A request-joined carries the
-	// visitor's role the way room-joined carries the others; the rest are
-	// signals with at most a code. Non-blocking like the cases above.
-	case "request-joined":
-		select {
-		case c.Role <- msg.Role:
-		default:
-		}
-
+	// The other reserved-room answers (spec 04 5.5): signals with at most a
+	// code. Non-blocking like the cases above.
 	case "refused":
 		select {
 		case c.Refused <- msg.Code:

@@ -316,9 +316,10 @@ var interruptHook atomic.Pointer[func() (line string, stop func())]
 //
 // The step reports whether the command has its outcome and ends on its own:
 // floe receive's does once the receive has finished, the engine having queued
-// "received", and only its wait for the sender to read it is left (A4-B22). The handler then prints nothing, runs no cleanup and leaves the
-// exit code to the command, and a second signal exits 130 at once, as for a
-// hook's nil stop. A step that stalls past interruptStopBound reports false.
+// "received", and only its wait for the sender to read it is left (A4-B22).
+// The handler then prints nothing, runs no cleanup and leaves the exit code
+// to the command, and a second signal exits 130 at once, as for a hook's nil
+// stop. A step that stalls past interruptStopBound reports false.
 var interruptStop atomic.Pointer[func() (ended bool)]
 
 // interruptCleanupBound is the one deadline the step and the partial-file
@@ -578,26 +579,20 @@ func linkAsCommand(a string) error {
 
 // looksLikeRoomLink reports whether arg is a room link, whole or cut short:
 // "room=" after a # or a ? or an &, in any letter case, in arg as typed or
-// with its percent escapes decoded, up to three times over, as
-// looksLikeRequestLink decodes. A room id is not required after it, so a
-// link cut short is caught too; a file name with "room=" in it is a command
-// cobra would refuse anyway, and only the words of that refusal change.
+// with its percent escapes decoded, up to three times over (inAnyDecoding).
+// A room id is not required after it, so a link cut short is caught too; a
+// file name with "room=" in it is a command cobra would refuse anyway, and
+// only the words of that refusal change.
 func looksLikeRoomLink(arg string) bool {
-	s := arg
-	for range 4 {
+	return inAnyDecoding(arg, func(s string) bool {
 		l := strings.ToLower(s)
 		for _, mark := range []string{"#room=", "?room=", "&room="} {
 			if strings.Contains(l, mark) {
 				return true
 			}
 		}
-		decoded := percentDecodeLoose(s)
-		if decoded == s {
-			return false
-		}
-		s = decoded
-	}
-	return false
+		return false
+	})
 }
 
 // outcomeError is an error that is an outcome, not a failure (TL-33's link

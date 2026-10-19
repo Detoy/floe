@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jannskiee/floe/cli/engine/signaling"
+	"github.com/jannskiee/floe/cli/engine/transfer"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -58,7 +59,9 @@ type Connection struct {
 	pendingCandidates []webrtc.ICECandidateInit
 	remoteCandidates  int
 
-	// connected is sent once when the PeerConnection reaches "connected" state
+	// connected receives the connection's outcome: nil when the PeerConnection
+	// reaches "connected", the error when it fails, disconnects or closes. A
+	// state that finds it full is dropped.
 	connected chan error
 
 	// early is the data channel's message pump, wired the instant the channel
@@ -246,7 +249,6 @@ func New(iceServers []webrtc.ICEServer, sc *signaling.Client, opts ...Option) (*
 		sc.SendSignal(map[string]interface{}{"candidate": init})
 	})
 
-	// Track when the connection becomes live (or fails).
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		conn.noteFailed(s)
 		switch s {
@@ -265,12 +267,8 @@ func New(iceServers []webrtc.ICEServer, sc *signaling.Client, opts ...Option) (*
 		}
 	})
 
-	// The dispatcher goroutine reads raw signals from the signaling channel
-	// and routes them to the typed offer/answer/candidate channels.
 	go conn.dispatchSignals()
 
-	// The candidate goroutine continuously adds remote ICE candidates,
-	// buffering them if the remote description is not yet set.
 	go conn.handleCandidates()
 
 	return conn, nil
@@ -308,7 +306,6 @@ func (conn *Connection) SetupAsSender() (*webrtc.DataChannel, error) {
 		go conn.Close()
 	})
 
-	// Create the SDP offer describing our capabilities
 	offer, err := conn.pc.CreateOffer(nil)
 	if err != nil {
 		return nil, &SetupError{Stage: StageOffer, Err: fmt.Errorf("failed to create offer: %w", err)}
@@ -321,7 +318,6 @@ func (conn *Connection) SetupAsSender() (*webrtc.DataChannel, error) {
 	// When the CLI is the sender, the browser reads its OWN answer SDP (not
 	// our offer) to determine max-message-size.  No patching needed here.
 
-	// Send the offer to the receiver via the signaling server
 	if err := conn.sc.SendSignal(signalPayload{Type: "offer", SDP: offer.SDP}); err != nil {
 		return nil, &SetupError{Stage: StageOffer, Err: fmt.Errorf("failed to send offer: %w", err)}
 	}
@@ -329,20 +325,14 @@ func (conn *Connection) SetupAsSender() (*webrtc.DataChannel, error) {
 	// Wait for the receiver's SDP answer (bounded so a vanished peer fails fast).
 	var answer webrtc.SessionDescription
 	select {
-	case a, ok := <-conn.answers:
-		if !ok {
-			return nil, &SetupError{Stage: StageAnswer, Err: fmt.Errorf("signaling closed before answer was received")}
-		}
+	case a := <-conn.answers:
 		answer = a
 	// The peer leaving, the server going away and a local Close end every
 	// setup wait at once, instead of costing the full timeout and reading as
 	// a failure to connect. PeerLeft is read here and in the three waits
 	// below only: the join waits that also read it all finish before New.
 	case <-conn.sc.PeerLeft:
-		if conn.signalingLost() {
-			return nil, &SetupError{Stage: StageSignalingLost, Err: ErrSignalingLost}
-		}
-		return nil, &SetupError{Stage: StagePeerLeft, Err: ErrPeerLeft}
+		return nil, conn.leftError()
 	case <-conn.done:
 		return nil, &SetupError{Stage: StageClosed, Err: ErrClosed}
 	case <-time.After(signalWait):
@@ -373,20 +363,14 @@ func (conn *Connection) SetupAsSender() (*webrtc.DataChannel, error) {
 		case <-dcOpen:
 			return dc, nil
 		case <-conn.sc.PeerLeft:
-			if conn.signalingLost() {
-				return nil, &SetupError{Stage: StageSignalingLost, Err: ErrSignalingLost}
-			}
-			return nil, &SetupError{Stage: StagePeerLeft, Err: ErrPeerLeft}
+			return nil, conn.leftError()
 		case <-conn.done:
 			return nil, &SetupError{Stage: StageClosed, Err: ErrClosed}
 		case <-time.After(connectGrace):
 			return nil, &SetupError{Stage: StageChannel, Err: fmt.Errorf("connected but the data channel did not open")}
 		}
 	case <-conn.sc.PeerLeft:
-		if conn.signalingLost() {
-			return nil, &SetupError{Stage: StageSignalingLost, Err: ErrSignalingLost}
-		}
-		return nil, &SetupError{Stage: StagePeerLeft, Err: ErrPeerLeft}
+		return nil, conn.leftError()
 	case <-conn.done:
 		return nil, &SetupError{Stage: StageClosed, Err: ErrClosed}
 	case <-time.After(connectTimeout):
@@ -399,7 +383,6 @@ func (conn *Connection) SetupAsSender() (*webrtc.DataChannel, error) {
 // and returns the open data channel ready for file transfer. Every failure
 // is a *SetupError naming its stage, with the text each site always had.
 func (conn *Connection) SetupAsReceiver() (*webrtc.DataChannel, error) {
-	// The receiver waits for a data channel from the sender.
 	dcChan := make(chan *webrtc.DataChannel, 1)
 	// No Floe offerer opens more than one data channel: SetupAsSender creates
 	// only "floe", and the browser, as simple-peer's initiator, creates one in
@@ -432,16 +415,10 @@ func (conn *Connection) SetupAsReceiver() (*webrtc.DataChannel, error) {
 	// Wait for the sender's SDP offer (bounded so a vanished peer fails fast).
 	var offer webrtc.SessionDescription
 	select {
-	case o, ok := <-conn.offers:
-		if !ok {
-			return nil, &SetupError{Stage: StageOffer, Err: fmt.Errorf("signaling closed before offer was received")}
-		}
+	case o := <-conn.offers:
 		offer = o
 	case <-conn.sc.PeerLeft:
-		if conn.signalingLost() {
-			return nil, &SetupError{Stage: StageSignalingLost, Err: ErrSignalingLost}
-		}
-		return nil, &SetupError{Stage: StagePeerLeft, Err: ErrPeerLeft}
+		return nil, conn.leftError()
 	case <-conn.done:
 		return nil, &SetupError{Stage: StageClosed, Err: ErrClosed}
 	case <-time.After(signalWait):
@@ -471,7 +448,6 @@ func (conn *Connection) SetupAsReceiver() (*webrtc.DataChannel, error) {
 	// the original. See patchMaxMessageSize.
 	patchedSDP := patchMaxMessageSize(answer.SDP)
 
-	// Send the answer to the sender
 	if err := conn.sc.SendSignal(signalPayload{Type: "answer", SDP: patchedSDP}); err != nil {
 		return nil, &SetupError{Stage: StageAnswer, Err: fmt.Errorf("failed to send answer: %w", err)}
 	}
@@ -491,20 +467,14 @@ func (conn *Connection) SetupAsReceiver() (*webrtc.DataChannel, error) {
 		case dc := <-dcChan:
 			return dc, nil
 		case <-conn.sc.PeerLeft:
-			if conn.signalingLost() {
-				return nil, &SetupError{Stage: StageSignalingLost, Err: ErrSignalingLost}
-			}
-			return nil, &SetupError{Stage: StagePeerLeft, Err: ErrPeerLeft}
+			return nil, conn.leftError()
 		case <-conn.done:
 			return nil, &SetupError{Stage: StageClosed, Err: ErrClosed}
 		case <-time.After(connectGrace):
 			return nil, &SetupError{Stage: StageChannel, Err: fmt.Errorf("connected but the data channel did not open")}
 		}
 	case <-conn.sc.PeerLeft:
-		if conn.signalingLost() {
-			return nil, &SetupError{Stage: StageSignalingLost, Err: ErrSignalingLost}
-		}
-		return nil, &SetupError{Stage: StagePeerLeft, Err: ErrPeerLeft}
+		return nil, conn.leftError()
 	case <-conn.done:
 		return nil, &SetupError{Stage: StageClosed, Err: ErrClosed}
 	case <-time.After(connectTimeout):
@@ -512,18 +482,14 @@ func (conn *Connection) SetupAsReceiver() (*webrtc.DataChannel, error) {
 	}
 }
 
-// signalingLost tells a PeerLeft push that came from the socket closing from
-// one the server sent: the signaling client closes Down before it pushes
-// PeerLeft on the way out of its read loop, so a closed Down here means the
-// server is gone, not the peer. A client built without Connect has a nil
-// Down, which reads as open.
-func (conn *Connection) signalingLost() bool {
-	select {
-	case <-conn.sc.Down:
-		return true
-	default:
-		return false
+// leftError is the setup error for a PeerLeft push at any of the setup waits:
+// the server gone when the push came from the socket closing (signaling's
+// IsDown), the other side gone when the server reported it.
+func (conn *Connection) leftError() error {
+	if conn.sc.IsDown() {
+		return &SetupError{Stage: StageSignalingLost, Err: ErrSignalingLost}
 	}
+	return &SetupError{Stage: StagePeerLeft, Err: ErrPeerLeft}
 }
 
 // Failed is closed when the peer connection reaches the failed state: ICE (or
@@ -575,34 +541,10 @@ func (conn *Connection) Fingerprints() (local, remote string, err error) {
 // ConnectionType reports the selected ICE path: "relay" when either side of the
 // selected candidate pair is a TURN relay, "direct" otherwise. Only meaningful
 // once the connection is established (call after SetupAsSender/SetupAsReceiver
-// returns); before that it returns an error.
-//
-// pathTypeOf in engine/transfer is the same walk started from the data channel
-// rather than the PeerConnection; a change here is a change there too.
+// returns); before that it returns an error. The walk is transfer.SelectedPath,
+// which the send's relay gate takes too.
 func (conn *Connection) ConnectionType() (string, error) {
-	sctp := conn.pc.SCTP()
-	if sctp == nil {
-		return "", fmt.Errorf("no SCTP transport")
-	}
-	dtls := sctp.Transport()
-	if dtls == nil {
-		return "", fmt.Errorf("no DTLS transport")
-	}
-	ice := dtls.ICETransport()
-	if ice == nil {
-		return "", fmt.Errorf("no ICE transport")
-	}
-	pair, err := ice.GetSelectedCandidatePair()
-	if err != nil {
-		return "", err
-	}
-	if pair == nil || pair.Local == nil || pair.Remote == nil {
-		return "", fmt.Errorf("no candidate pair selected")
-	}
-	if pair.Local.Typ == webrtc.ICECandidateTypeRelay || pair.Remote.Typ == webrtc.ICECandidateTypeRelay {
-		return "relay", nil
-	}
-	return "direct", nil
+	return transfer.SelectedPath(conn.pc.SCTP())
 }
 
 // setRemoteDesc sets the remote SDP and flushes any buffered ICE candidates.
@@ -720,10 +662,7 @@ func (conn *Connection) dispatchSignals() {
 		select {
 		case <-conn.done:
 			return
-		case raw, ok := <-conn.sc.Signal:
-			if !ok {
-				return
-			}
+		case raw := <-conn.sc.Signal:
 			rawSignal = raw
 		}
 
@@ -758,10 +697,7 @@ func (conn *Connection) handleCandidates() {
 		select {
 		case <-conn.done:
 			return
-		case c, ok := <-conn.candidates:
-			if !ok {
-				return
-			}
+		case c := <-conn.candidates:
 			conn.addRemoteCandidate(c)
 		}
 	}

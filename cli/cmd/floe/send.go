@@ -15,7 +15,6 @@ import (
 	"github.com/jannskiee/floe/cli/engine/ice"
 	"github.com/jannskiee/floe/cli/engine/peer"
 	"github.com/jannskiee/floe/cli/engine/serverurl"
-	"github.com/jannskiee/floe/cli/engine/signaling"
 	"github.com/jannskiee/floe/cli/engine/transfer"
 	"github.com/pion/webrtc/v4"
 	"github.com/spf13/cobra"
@@ -77,7 +76,8 @@ func runSend(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Pre-compute file summary for the share box (same walk as SendFiles).
+	// Pre-compute file summary for the share box (same walk as
+	// SendFilesWithOptions).
 	summary, err := transfer.Summarize(args)
 	if err != nil {
 		return err
@@ -89,7 +89,7 @@ func runSend(cmd *cobra.Command, args []string) error {
 	roomId := uuid.New().String()
 
 	// 2. Fetch ICE (STUN/TURN) server credentials
-	iceServers, degraded, err := ice.FetchDetail(flagServer)
+	iceServers, degraded, err := fetchICE(flagServer)
 	if err != nil {
 		return fmt.Errorf("failed to fetch ICE credentials: %w", err)
 	}
@@ -103,7 +103,7 @@ func runSend(cmd *cobra.Command, args []string) error {
 	}
 
 	// 3. Connect to the signaling server via WebSocket
-	sc, err := signaling.Connect(flagServer)
+	sc, err := connectSignaling(flagServer)
 	if err != nil {
 		return signalingConnectError(err)
 	}
@@ -149,7 +149,12 @@ func runSend(cmd *cobra.Command, args []string) error {
 		webURL = serverurl.Web(flagServer)
 	}
 	// The room id goes in the URL fragment (#room=) so it never reaches the
-	// web server or its analytics when a browser opens this link.
+	// web server or its analytics when a browser opens this link. Unlike the
+	// desktop's and the web app's links it has no ?s= nonce: a tab with Floe
+	// already open reloads into the new room when only the fragment changes
+	// (P2PTransfer's hashchange reload), and one that still holds a transfer or
+	// an unsaved file asks first or waits for it, where a new document would
+	// drop the file.
 	link := webURL + "/#room=" + roomId
 
 	fmt.Printf("  Sending   %s\n", summary.Label)
@@ -158,23 +163,21 @@ func runSend(cmd *cobra.Command, args []string) error {
 	fmt.Println("  Waiting for peer...")
 
 	// 7. Wait for the receiver to join
-	var peerId string
 	select {
-	case peerId = <-sc.PeerConnected:
+	case <-sc.PeerConnected:
 	case <-sc.PeerLeft:
 		// Two things push PeerLeft: the server reporting the other side gone,
 		// and the signaling client's read loop on its way out, when this
 		// side's own connection to the server is lost. One line for both
 		// named the peer either way. Each now prints the sentence the setup
 		// below prints for the same cause (setupFailureLine).
-		if signalingDown(sc) {
+		if sc.IsDown() {
 			return peer.ErrSignalingLost
 		}
 		return peer.ErrPeerLeft
 	case errMsg := <-sc.Errors:
 		return fmt.Errorf("server error: %s", errMsg)
 	}
-	_ = peerId // used internally by signaling routing
 
 	// 8. Set up WebRTC as the initiator (sender creates offer + data channel)
 	conn, err := peer.New(iceServers, sc, peerOptions()...)
@@ -192,15 +195,16 @@ func runSend(cmd *cobra.Command, args []string) error {
 	}
 
 	if !r.connected(dc, conn) {
-		return r.park()
+		return park()
 	}
 	fmt.Println(connectedLine(conn.ConnectionType()))
 	fmt.Println()
 
-	// 9. Send files. The pump comes from the connection, not from SendFiles: see
-	// peer.Early for why registering it later can silently lose a message. A Go
-	// receiver's word after the last file has no deadline, so an ICE failure
-	// closes the connection and ends the wait (connfailed.go).
+	// 9. Send files. The pump comes from the connection, not from
+	// SendFilesWithOptions: see peer.Early for why registering it later can
+	// silently lose a message. A Go receiver's word after the last file has no
+	// deadline, so an ICE failure closes the connection and ends the wait
+	// (connfailed.go).
 	quit := make(chan struct{})
 	defer close(quit)
 	closeOnFailed(conn, quit)
@@ -213,7 +217,7 @@ func runSend(cmd *cobra.Command, args []string) error {
 		Stop: r.halt,
 	})
 	if !r.finish(err == nil) {
-		return r.park()
+		return park()
 	}
 	return plainSendEnd(err)
 }
@@ -347,30 +351,6 @@ func (r *sendRun) finish(delivered bool) bool {
 	}
 	r.over = true
 	return true
-}
-
-// park ends the command once Ctrl+C has its ending, as the receive's does: in
-// the binary never (parkUntilExit), so main's os.Exit(1) cannot race the
-// handler's exit 130 or print "Error: the send was stopped" after
-// "Canceled.". A test that lets it return gets the error execute prints
-// nothing for.
-func (r *sendRun) park() error {
-	parkUntilExit()
-	return errSendToEnded
-}
-
-// signalingDown reports whether sc's socket to the signaling server is gone.
-// The client closes Down before the PeerLeft push it sends on the way out of
-// its read loop, so a reader woken by PeerLeft can tell a lost server from a
-// peer the server reported gone; peer.Connection reads it the same way during
-// setup. A client built without Connect has a nil Down, which reads as open.
-func signalingDown(sc *signaling.Client) bool {
-	select {
-	case <-sc.Down:
-		return true
-	default:
-		return false
-	}
 }
 
 // errTheyStopped is the plain send's line when the receiver ended the

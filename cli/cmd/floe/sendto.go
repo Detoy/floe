@@ -47,8 +47,8 @@ var sendToAckTimeout = transfer.VisitorAckTimeout + transfer.VisitorAckGrace
 // shrink it, and whichever ends first ends the join.
 var sendToJoinTimeout = 10 * time.Second
 
-// fetchICE and connectSignaling are the first two network calls of the
-// request-link send and of receive, as vars so a test can count them and
+// fetchICE and connectSignaling are the first two network calls of floe send,
+// the request-link send and floe receive, as vars so a test can count them and
 // refuse every server but its own fake: a guard that a mutation removes must
 // never reach api.floe.one from a test.
 var (
@@ -146,6 +146,15 @@ var sendToStopBound = 3 * time.Second
 // command return once the handler has exited.
 var parkUntilExit = func() { select {} }
 
+// park ends a plain send or a receive once Ctrl+C has its ending: in the
+// binary never (parkUntilExit), so main's os.Exit(1) cannot race the
+// handler's exit 130 or print a line after "Canceled." (FU-54 review 1 M2).
+// A test that lets it return gets the error execute prints nothing for.
+func park() error {
+	parkUntilExit()
+	return errSendToEnded
+}
+
 // sendToPhase is where one send stands, for its Ctrl+C.
 type sendToPhase int
 
@@ -183,7 +192,7 @@ type sendToRun struct {
 }
 
 func newSendToRun() *sendToRun {
-	return &sendToRun{stop: make(chan struct{}), settled: make(chan struct{})}
+	return &sendToRun{phase: phaseSetup, stop: make(chan struct{}), settled: make(chan struct{})}
 }
 
 // interrupt is the send's Ctrl+C (TL-28, TL-29), on the signal goroutine.
@@ -366,7 +375,7 @@ func runSendTo(cmd *cobra.Command, args []string) error {
 		return r.fail(cmd, lineCouldNotConnect)
 	}
 
-	files, err := transfer.PrecheckDrop(args, version)
+	files, totalBytes, err := transfer.PrecheckDrop(args, version)
 	switch {
 	case errors.Is(err, transfer.ErrTooManyFiles):
 		return r.fail(cmd, lineTooManyFiles)
@@ -376,11 +385,7 @@ func runSendTo(cmd *cobra.Command, args []string) error {
 		return r.keep(cmd, err)
 	}
 	r.files.Store(int64(files))
-	summary, err := transfer.Summarize(args)
-	if err != nil {
-		return r.keep(cmd, err)
-	}
-	r.say("  Sending   " + sendToLabel(args, files, summary.TotalBytes))
+	r.say("  Sending   " + sendToLabel(args, files, totalBytes))
 
 	iceServers, degraded, err := fetchICE(flagServer)
 	if err != nil {
@@ -457,7 +462,7 @@ func runSendTo(cmd *cobra.Command, args []string) error {
 	// TL-11: a relayed drop over the cap ends here, before WAIT, on today's
 	// sentence, and the host is told why exactly as the send's own gate tells
 	// it (a text abort with the gate's words, then the flush).
-	if err := relayGateFor(dc, summary.TotalBytes); err != nil {
+	if err := relayGateFor(dc, totalBytes); err != nil {
 		transfer.AbortSend(dc, version, err.Error())
 		return r.keep(cmd, err)
 	}
@@ -492,7 +497,7 @@ func runSendTo(cmd *cobra.Command, args []string) error {
 	if acceptedAt.IsZero() {
 		acceptedAt = time.Now()
 	}
-	lines := []string{arrivedLine(delivered.Files, summary.TotalBytes, time.Since(acceptedAt), routeOf(conn))}
+	lines := []string{arrivedLine(delivered.Files, totalBytes, time.Since(acceptedAt), routeOf(conn))}
 	// The host's report, not a proof made here, and only when it says every
 	// file matched (verified is the received frame's count, which the engine
 	// accepts only from 0 to the file count).
@@ -778,9 +783,16 @@ var roomIDLead = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 //
 // A room link spells its fragment #room=, so none matches.
 func looksLikeRequestLink(arg string) bool {
+	return inAnyDecoding(arg, hashBeforeRoomID)
+}
+
+// inAnyDecoding reports whether match holds for arg as typed or with its
+// percent escapes decoded, up to three times over: the decoding both link
+// matchers apply (looksLikeRequestLink, looksLikeRoomLink).
+func inAnyDecoding(arg string, match func(string) bool) bool {
 	s := arg
 	for range 4 {
-		if hashBeforeRoomID(s) {
+		if match(s) {
 			return true
 		}
 		decoded := percentDecodeLoose(s)

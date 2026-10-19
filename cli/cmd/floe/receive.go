@@ -213,7 +213,7 @@ func runReceive(cmd *cobra.Command, args []string) error {
 	}
 
 	if !r.connected(dc, conn) {
-		return r.park()
+		return park()
 	}
 	fmt.Println(connectedLine(conn.ConnectionType()))
 
@@ -222,8 +222,9 @@ func runReceive(cmd *cobra.Command, args []string) error {
 	if flagNoReport || os.Getenv("FLOE_NO_STATS") == "1" {
 		statsURL = "" // reportBytesToServer no-ops on empty URL
 	}
-	// The pump comes from the connection, not from ReceiveFiles: see peer.Early.
-	// This is the side that was actually losing the sender's first message.
+	// The pump comes from the connection, not from ReceiveFilesWithOptions: see
+	// peer.Early. This is the side that was actually losing the sender's first
+	// message.
 	early := conn.Early()
 	err = transfer.ReceiveFilesWithOptions(dc, absOutput, flagAutoAccept, version, statsURL, transfer.ReceiveOptions{
 		Messages: early.Msgs,
@@ -234,7 +235,7 @@ func runReceive(cmd *cobra.Command, args []string) error {
 		OnReceivedSent: r.receivedSent,
 	})
 	if !r.finish() {
-		return r.park()
+		return park()
 	}
 	return err
 }
@@ -272,9 +273,8 @@ func checkOutputDir(dir string) error {
 }
 
 // receiveStopFlush bounds the wait for the stop frame to leave before the
-// close, inside the handler's interruptStopBound. A var only so a test can
-// shrink it.
-var receiveStopFlush = 750 * time.Millisecond
+// close, inside the handler's interruptStopBound.
+const receiveStopFlush = 750 * time.Millisecond
 
 // receiveRun is what one receive shares with its Ctrl+C step, which runs on
 // the signal goroutine (interruptStop). Exactly one of the two ends the
@@ -404,13 +404,4 @@ func (r *receiveRun) finish() bool {
 	}
 	r.over = true
 	return true
-}
-
-// park ends the command once Ctrl+C has its ending: in the binary never
-// (parkUntilExit), so main's os.Exit(1) cannot race the handler's exit 130 or
-// print a line after "Canceled." (FU-54 review 1 M2). A test that lets it
-// return gets the error execute prints nothing for.
-func (r *receiveRun) park() error {
-	parkUntilExit()
-	return errSendToEnded
 }

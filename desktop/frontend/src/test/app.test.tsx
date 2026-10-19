@@ -894,6 +894,76 @@ describe('Settings > Notifications (S-11)', () => {
     });
 });
 
+// Check for updates is Go-owned like the two notification switches: set at
+// once, its own setter called, and put back if the setter throws.
+describe('Settings > Check for updates', () => {
+    it('calls SetCheckUpdates(false), and a refusal flips the switch back', async () => {
+        const user = userEvent.setup();
+        mount();
+        await settled();
+        await user.click(screen.getByRole('button', {name: 'Settings'}));
+        const box = () => screen.getByRole('checkbox', {name: /^Check for updates/}) as HTMLInputElement;
+        expect(box().checked).toBe(true);
+        await user.click(box());
+        await waitFor(() => expect(wails.go.SetCheckUpdates).toHaveBeenCalledWith(false));
+        expect(box().checked).toBe(false);
+
+        wails.go.SetCheckUpdates.mockRejectedValueOnce(new Error('disk full'));
+        await user.click(box());
+        await waitFor(() => expect(wails.go.SetCheckUpdates).toHaveBeenCalledWith(true));
+        await waitFor(() => expect(box().checked).toBe(false));
+        // Its own setter only: the whole-record save is not this switch's.
+        expect(wails.go.SetSettings).not.toHaveBeenCalled();
+    });
+});
+
+// What each picker stages or fills, through its own binding (SelectFiles,
+// SelectFolder). The drop zone's Files button shares its name with the Send
+// tab's Files choice, so the two zone buttons are found inside the zone.
+describe('the pickers', () => {
+    const zone = () => within(screen.getByText('Select files to send').parentElement!);
+
+    it('Files stages what SelectFiles picked', async () => {
+        wails.go.SelectFiles.mockImplementation(async () => ['C:\\Users\\test\\a.txt', 'C:\\Users\\test\\b.txt']);
+        const user = userEvent.setup();
+        mount();
+        await settled();
+        await user.click(zone().getByRole('button', {name: 'Files'}));
+        expect(await screen.findByRole('button', {name: 'Send 2 items'})).toBeTruthy();
+        expect(screen.getByRole('button', {name: 'Remove a.txt'})).toBeTruthy();
+    });
+
+    it('Folder stages the folder SelectFolder picked', async () => {
+        wails.go.SelectFolder.mockImplementation(async () => 'C:\\Users\\test\\Photos');
+        const user = userEvent.setup();
+        mount();
+        await settled();
+        await user.click(zone().getByRole('button', {name: 'Folder'}));
+        expect(await screen.findByRole('button', {name: 'Send 1 item'})).toBeTruthy();
+        expect(screen.getByRole('button', {name: 'Remove Photos'})).toBeTruthy();
+    });
+
+    it('Receive > Browse fills Save to with the folder SelectFolder picked', async () => {
+        wails.go.SelectFolder.mockImplementation(async () => 'D:\\Incoming');
+        const user = userEvent.setup();
+        mount();
+        await settled();
+        await user.click(screen.getAllByRole('button', {name: 'Receive'})[0]);
+        await user.click(screen.getByRole('button', {name: 'Browse'}));
+        await waitFor(() => expect((screen.getByPlaceholderText('Downloads (default)') as HTMLInputElement).value).toBe('D:\\Incoming'));
+    });
+
+    it('Settings > Browse fills Save received files to with the folder SelectFolder picked', async () => {
+        wails.go.SelectFolder.mockImplementation(async () => 'D:\\Incoming');
+        const user = userEvent.setup();
+        mount();
+        await settled();
+        await user.click(screen.getByRole('button', {name: 'Settings'}));
+        await user.click(await screen.findByRole('button', {name: 'Browse'}));
+        await waitFor(() => expect((screen.getByLabelText('Save received files to') as HTMLInputElement).value).toBe('D:\\Incoming'));
+    });
+});
+
 /**
  * A request link pasted into Receive > CODE (S1-DSK-07, VR3-D06). The link is
  * for a web browser; Floe must say so and must never start a code receive,
@@ -2176,10 +2246,7 @@ describe('the File Explorer entry at launch', () => {
         await user.click(screen.getByRole('button', {name: 'Settings'}));
         return (await screen.findByRole('checkbox', {name: /^Show in right-click menu/}) as HTMLInputElement).checked;
     };
-    // ContextMenuEnabled answers false in every case, as the Go method does
-    // for an entry that is missing or another copy's.
     const launch = async (state: string, marker: string | null, installed: boolean) => {
-        wails.go.ContextMenuEnabled.mockImplementation(async () => false);
         wails.go.ContextMenuState.mockImplementation(async () => state);
         wails.go.IsInstalled.mockImplementation(async () => installed);
         if (marker !== null) localStorage.setItem('floe:ctx-menu', marker);

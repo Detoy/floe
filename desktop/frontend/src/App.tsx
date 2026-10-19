@@ -46,7 +46,7 @@ import {
     SquareArrowOutUpRight,
     X,
 } from 'lucide-react';
-import {BoltMark, Button, cn, Eyebrow, Input, rowDescClass, rowLabelClass, StatusDot} from './components/ui';
+import {BoltMark, Button, cn, DialogShell, Eyebrow, Input, rowDescClass, rowLabelClass, StatusDot} from './components/ui';
 import {
     NOTIFICATION_SETTINGS_URI,
     NOTIFICATIONS_HEADING,
@@ -116,6 +116,7 @@ import SharePanel from './components/SharePanel';
 import HistoryView from './components/HistoryView';
 import RequestLinkView, {DECLINED_LINE_ID, LABEL_INPUT_ID, PROMPT_ACTIONS_ID, PROMPT_HEADING_ID} from './components/RequestLinkView';
 import {useCardPin} from './cardPin';
+import {useCopied} from './copied';
 
 type Mode = 'send' | 'receive' | 'history';
 
@@ -146,6 +147,10 @@ const cardClass = 'overflow-hidden rounded-lg border border-white/[0.06] bg-whit
 // collapsed Advanced disclosure (v4 divide-y compiles to :not(:last-child)
 // border-bottom with no hidden/collapsed escape).
 const insetHairline = '[&>*+*]:relative [&>*+*]:before:absolute [&>*+*]:before:inset-x-3.5 [&>*+*]:before:top-0 [&>*+*]:before:h-px [&>*+*]:before:bg-white/[0.05]';
+// The words of a console's sub-tab row (Send > FILES | TEXT, Receive > CODE |
+// REQUEST LINK), the chosen one underlined in white.
+const subTabClass = (on: boolean) => cn('border-b pb-0.5 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors',
+    on ? 'border-white text-zinc-200' : 'border-transparent text-zinc-400 hover:text-zinc-300');
 
 function App() {
     // Only the transfer tabs are ever persisted; anything else in the store
@@ -211,8 +216,7 @@ function App() {
     const [testStatus, setTestStatus] = useState('');
     const [testing, setTesting] = useState(false);
     // Transient label flip on the About Copy button.
-    const [aboutCopied, setAboutCopied] = useState(false);
-    const aboutTimer = useRef<number | null>(null);
+    const {copied: aboutCopied, copyText} = useCopied<true>();
 
     // Whether the Advanced section is open. null means "not touched this visit",
     // which is what lets a configured server force it open without preventing the
@@ -404,10 +408,18 @@ function App() {
     // queued, as a drop during a transfer always was.
     function addFiles(paths: string[]) {
         if (!paths || !paths.length || busyRef.current || modalOpenRef.current) return;
-        supersede('files');
         setSettingsOpen(false);
         setMode('send');
         setSendKind('files');
+        stageFiles(paths);
+    }
+
+    // stageFiles merges paths into the send selection, the part addFiles and
+    // both send pickers share. supersede, functional updates and stable setters
+    // only, so the once-registered closures that reach it through addFiles see
+    // nothing stale.
+    function stageFiles(paths: string[]) {
+        supersede('files');
         setFiles((prev) => mergePaths(prev, paths, isWindows));
         setSendDone(false);
         setSendStatus('');
@@ -424,36 +436,19 @@ function App() {
         }
     }
 
-    // Not routed through saveSettings: the field is owned by its own Go setter
-    // so the Settings screen's whole-record save can never clobber it.
-    async function toggleCheckUpdates(v: boolean) {
-        setCheckUpdates(v);
-        try {
-            await SetCheckUpdates(v);
-        } catch {
-            setCheckUpdates(!v); // revert on failure, the toggleCtxMenu pattern
-        }
+    // Check for updates and the two notification switches are not routed
+    // through saveSettings: each field is owned by its own Go setter, so the
+    // whole-record save below can never clobber it. Each is set at once and put
+    // back if its setter throws, the toggleCtxMenu pattern.
+    function optimistic(set: (v: boolean) => void, persist: (v: boolean) => Promise<void>) {
+        return async (v: boolean) => {
+            set(v);
+            try { await persist(v); } catch { set(!v); }
+        };
     }
-
-    // The same pattern for the two notification switches: each has its own Go
-    // setter, so the whole-record save below can never clobber them.
-    async function toggleNotifications(v: boolean) {
-        setNotificationsOn(v);
-        try {
-            await SetToasts(v);
-        } catch {
-            setNotificationsOn(!v);
-        }
-    }
-
-    async function toggleNotificationSound(v: boolean) {
-        setNotificationSound(v);
-        try {
-            await SetToastSound(v);
-        } catch {
-            setNotificationSound(!v);
-        }
-    }
+    const toggleCheckUpdates = optimistic(setCheckUpdates, SetCheckUpdates);
+    const toggleNotifications = optimistic(setNotificationsOn, SetToasts);
+    const toggleNotificationSound = optimistic(setNotificationSound, SetToastSound);
 
     // saveSettings writes the whole record, because Go persists it as one file.
     //
@@ -515,8 +510,8 @@ function App() {
         return s ? ` · Both people must use ${hostOf(s)}` : '';
     }
 
-    // Copies the About rows for pasting into a bug report. Mirrors SharePanel's
-    // copy handler, including the 1500ms label flip.
+    // Copies the About rows for pasting into a bug report, with the Copied mark
+    // every copy button shares (useCopied).
     //
     // The server line is the whole reason this button is worth having: almost every
     // confusing report about a transfer that will not connect comes down to the two
@@ -529,14 +524,7 @@ function App() {
             `Server: ${serverAddrRef.current.trim() || 'api.floe.one (default)'}`,
         ];
         if (webAddrRef.current.trim()) lines.push(`Share links: ${webAddrRef.current.trim()}`);
-        try {
-            await navigator.clipboard.writeText(lines.join('\n'));
-            setAboutCopied(true);
-            if (aboutTimer.current !== null) clearTimeout(aboutTimer.current);
-            aboutTimer.current = window.setTimeout(() => setAboutCopied(false), 1500);
-        } catch {
-            // clipboard unavailable
-        }
+        await copyText(true, lines.join('\n'));
     }
 
     // Clears both addresses and persists immediately. It cannot rely on the blur
@@ -617,10 +605,10 @@ function App() {
     // wrong anywhere else. It was briefly used as a general fallback, which was a
     // no-op on every screen but Settings.
     //
-    // Looked up by id rather than by ref because Button is a plain React 18
-    // function component shared with the transfer screen: accepting a ref would
-    // mean wrapping it in forwardRef, and this is not worth widening that surface.
-    // The rAF waits for the dialog to unmount before moving focus.
+    // Looked up by id rather than by ref because Button is a plain function
+    // component shared with the transfer screen, whose props take no ref, and
+    // this is not worth widening that surface. The rAF waits for the dialog to
+    // unmount before moving focus.
     function focusResetTrigger() {
         requestAnimationFrame(() => document.getElementById('floe-reset-trigger')?.focus());
     }
@@ -1152,11 +1140,10 @@ function App() {
     //
     // preventDefault is belt and braces, not the mechanism. Wails disables the
     // webview's browser accelerator keys outright during setup
-    // (PutAreBrowserAcceleratorKeysEnabled(false), frontend.go:589, ungated and
-    // fatal on failure), and Ctrl+R is on that list, so this key has never been
-    // able to reload the app. An earlier comment here claimed otherwise. It is
-    // kept because it costs nothing and would still be right if Wails ever
-    // stopped doing that.
+    // (PutAreBrowserAcceleratorKeysEnabled(false) in its windows frontend.go,
+    // ungated and fatal on failure), and Ctrl+R is on that list, so this key has
+    // never been able to reload the app. It is kept because it costs nothing and
+    // would still be right if Wails ever stopped doing that.
     useEffect(() => {
         const onKey = (e: KeyboardEvent) => {
             if ((e.ctrlKey || e.metaKey) && (e.key === 'r' || e.key === 'R')) {
@@ -1263,12 +1250,18 @@ function App() {
     async function pickFiles() {
         try {
             const picked = await SelectFiles();
-            if (picked && picked.length) {
-                supersede('files');
-                setFiles((prev) => mergePaths(prev, picked, isWindows));
-                setSendDone(false);
-                setSendStatus('');
-            }
+            if (picked && picked.length) stageFiles(picked);
+        } catch {
+            // dialog cancelled
+        }
+    }
+
+    // pickFolder opens the folder picker and hands a chosen folder on, for the
+    // send view, both Save to fields and the request link's Save to.
+    async function pickFolder(use: (dir: string) => void) {
+        try {
+            const dir = await SelectFolder();
+            if (dir) use(dir);
         } catch {
             // dialog cancelled
         }
@@ -1276,19 +1269,7 @@ function App() {
 
     // Folders merge like files. Known edge: picking a folder plus a file inside it
     // sends that file twice (the engine walks the folder); path dedupe cannot see it.
-    async function pickSendFolder() {
-        try {
-            const dir = await SelectFolder();
-            if (dir) {
-                supersede('files');
-                setFiles((prev) => mergePaths(prev, [dir], isWindows));
-                setSendDone(false);
-                setSendStatus('');
-            }
-        } catch {
-            // dialog cancelled
-        }
-    }
+    function pickSendFolder() { return pickFolder((dir) => stageFiles([dir])); }
 
     // No discard here, and not by oversight: an offer only ever stands over
     // an emptied tab, so there is no row left to remove from while one is up. If
@@ -1411,14 +1392,7 @@ function App() {
         return true;
     }
 
-    async function pickSaveFolder() {
-        try {
-            const dir = await SelectFolder();
-            if (dir) setOutput(dir);
-        } catch {
-            // dialog cancelled
-        }
-    }
+    function pickSaveFolder() { return pickFolder(setOutput); }
 
     async function send() {
         if (sendKind === 'text') {
@@ -1859,14 +1833,7 @@ function App() {
             else localStorage.removeItem('floe:requestSaveDir');
         } catch { /* storage unavailable */ }
     }
-    async function pickRequestFolder() {
-        try {
-            const dir = await SelectFolder();
-            if (dir) changeRequestSaveDir(dir);
-        } catch {
-            // dialog cancelled
-        }
-    }
+    function pickRequestFolder() { return pickFolder(changeRequestSaveDir); }
     // Make another link is one of the three focus moves the owner asks for.
     function makeAnotherLink() {
         dispatchReq({type: 'MAKE_ANOTHER'});
@@ -1903,18 +1870,14 @@ function App() {
     );
 
     // Receive > CODE | REQUEST LINK (R1): two aria-pressed words like the
-    // History toggle, each named by its own word. The Beta chip beside REQUEST
-    // LINK (R2) and the name that carried it (R3) went at desktop-v1.0.0.
-    // Plain elements, not components, so nothing remounts.
+    // History toggle, each named by its own word. Plain elements, not
+    // components, so nothing remounts.
     const choiceButton = (k: 'code' | 'request') => (
         <button
             type="button"
             aria-pressed={receiveKind === k}
             onClick={() => setReceiveKind(k)}
-            className={cn(
-                'border-b pb-0.5 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors',
-                receiveKind === k ? 'border-white text-zinc-200' : 'border-transparent text-zinc-400 hover:text-zinc-300',
-            )}
+            className={subTabClass(receiveKind === k)}
         >
             {k === 'code' ? CODE_TAB : REQUEST_TAB}
         </button>
@@ -2495,10 +2458,7 @@ function App() {
                                                         // in the box, and it has to survive one when it sits
                                                         // in an offer, or Clear would be a trap.
                                                         onClick={() => setSendKind(k)}
-                                                        className={cn(
-                                                            'border-b pb-0.5 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors',
-                                                            sendKind === k ? 'border-white text-zinc-200' : 'border-transparent text-zinc-400 hover:text-zinc-300',
-                                                        )}
+                                                        className={subTabClass(sendKind === k)}
                                                     >
                                                         {k === 'files' ? 'Files' : 'Text'}
                                                     </button>
@@ -2786,13 +2746,7 @@ function App() {
                 it must sit on top and be dismissed first, and a preferences dialog
                 must never occlude it. */}
             {confirmDefaults && (
-                <div className="fixed inset-x-0 bottom-0 top-9 z-50 grid place-items-center bg-black/70">
-                    <div
-                        role="dialog"
-                        aria-modal="true"
-                        aria-labelledby="floe-reset-title"
-                        className="animate-floe-in mx-4 w-full max-w-sm rounded-xl border border-white/10 bg-zinc-900 p-5 shadow-2xl"
-                    >
+                <DialogShell labelledBy="floe-reset-title">
                         <h2 id="floe-reset-title" className="text-sm font-semibold text-white">Reset all settings?</h2>
                         <p className="mt-1.5 text-xs leading-relaxed text-zinc-400">
                             Save folder, notifications, privacy and server settings go back to defaults
@@ -2821,8 +2775,7 @@ function App() {
                             <Button variant="outline" onClick={() => { setConfirmDefaults(false); focusResetTrigger(); }}>Cancel</Button>
                             <Button onClick={resetAllSettings}>Reset all settings</Button>
                         </div>
-                    </div>
-                </div>
+                </DialogShell>
             )}
 
             {/* start-over guard: shown only when the reset would destroy moving
@@ -2831,13 +2784,7 @@ function App() {
                 states earn a prompt and which deliberately do not. Sits below
                 the titlebar so the window controls remain reachable. */}
             {confirmReset && (
-                <div className="fixed inset-x-0 bottom-0 top-9 z-50 grid place-items-center bg-black/70">
-                    <div
-                        role="dialog"
-                        aria-modal="true"
-                        aria-labelledby="floe-startover-title"
-                        className="animate-floe-in mx-4 w-full max-w-sm rounded-xl border border-white/10 bg-zinc-900 p-5 shadow-2xl"
-                    >
+                <DialogShell labelledBy="floe-startover-title">
                         <h2 id="floe-startover-title" className="text-sm font-semibold text-white">Start over?</h2>
                         {/* resetWarning decided to open this dialog, so it also
                             supplies the sentence. One source, so the guard and
@@ -2860,17 +2807,10 @@ function App() {
                                 an unasked-for jump. */}
                             <Button onClick={() => { doReset(); focusLockup(); }}>Start over</Button>
                         </div>
-                    </div>
-                </div>
+                </DialogShell>
             )}
             {closeGuard && (
-                <div className="fixed inset-x-0 bottom-0 top-9 z-50 grid place-items-center bg-black/70">
-                    <div
-                        role="dialog"
-                        aria-modal="true"
-                        aria-labelledby="floe-close-title"
-                        className="animate-floe-in mx-4 w-full max-w-sm rounded-xl border border-white/10 bg-zinc-900 p-5 shadow-2xl"
-                    >
+                <DialogShell labelledBy="floe-close-title">
                         <h2 id="floe-close-title" className="text-sm font-semibold text-white">Close Floe?</h2>
                         <p className="mt-1.5 text-xs leading-relaxed text-zinc-400">
                             {sending
@@ -2898,8 +2838,7 @@ function App() {
                                 {CLOSE_FLOE}
                             </Button>
                         </div>
-                    </div>
-                </div>
+                </DialogShell>
             )}
         </div>
     );

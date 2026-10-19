@@ -1,6 +1,7 @@
 package ice
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -174,6 +175,51 @@ func TestParseServersRejectsJunk(t *testing.T) {
 	if _, err := ParseServers(strings.NewReader(`<html>not json</html>`)); err == nil {
 		t.Fatal("ParseServers accepted a non-JSON body")
 	}
+}
+
+// TestParseServersStopsAtTheBodyBound: a list that runs past 64 KiB is
+// refused after reading at most 64 KiB of it, whatever the server keeps
+// sending. A JSON decoder holds a whole value before it unmarshals, so the
+// unbounded read took a valid 64 MiB list whole and allocated 1,356 MiB.
+func TestParseServersStopsAtTheBodyBound(t *testing.T) {
+	const bound = 64 << 10
+	entry := `{"urls":"stun:stun.example.invalid:3478"},`
+	body := "[" + strings.Repeat(entry, (1<<20)/len(entry)) + `{"urls":"stun:last"}]`
+	r := &countingReader{r: strings.NewReader(body)}
+	if _, err := ParseServers(r); err == nil {
+		t.Fatal("ParseServers accepted a 1 MiB list")
+	}
+	if r.n > bound {
+		t.Fatalf("ParseServers read %d bytes of the body, want at most %d", r.n, bound)
+	}
+}
+
+// TestParseServersTakesAListAtTheBound: a list that ends exactly at 64 KiB is
+// read whole and parsed, so the bound refuses nothing a server can fit in it.
+func TestParseServersTakesAListAtTheBound(t *testing.T) {
+	const bound = 64 << 10
+	entry := `{"urls":"stun:stun.example.invalid:3478"},`
+	head := "[" + strings.Repeat(entry, (bound-200)/len(entry)) + `{"urls":"stun:`
+	tail := `"}]`
+	body := head + strings.Repeat("a", bound-len(head)-len(tail)) + tail
+	if len(body) != bound {
+		t.Fatalf("the test list is %d bytes, want %d", len(body), bound)
+	}
+	if _, err := ParseServers(strings.NewReader(body)); err != nil {
+		t.Fatalf("ParseServers refused a list of exactly %d bytes: %v", bound, err)
+	}
+}
+
+// countingReader counts the bytes its reader hands out.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
 }
 
 // TestHasRelay pins the question both relay-only surfaces ask before they

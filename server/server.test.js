@@ -69,9 +69,12 @@ const {
     codeRateLimits,
     selectMinimalIceUrls,
     createWSPeer,
+    createSocketIOPeer,
     heartbeatTick,
     handlePong,
     WS_SEND_BUFFER_CEILING,
+    SIO_SEND_BUFFER_CEILING,
+    SIO_SEND_QUEUE_CEILING,
     server,
     healthHandler,
     policyStore,
@@ -2370,6 +2373,151 @@ describe('createWSPeer backpressure', () => {
 
         const source = require('node:fs').readFileSync(require.resolve('./server.js'), 'utf8');
         assert.match(source, /maxPayload: 1e6/, 'maxPayload must still be the 1 MB the ceiling mirrors');
+    });
+});
+
+// The parts of a Socket.IO server socket createSocketIOPeer().send touches:
+// connected, emit, disconnect, and engine.io's session under conn.
+function fakeSocketIO({ writeBuffer = [], bufferedAmount = 0, ...overrides } = {}) {
+    return {
+        id: 'sio-1',
+        connected: true,
+        emitted: [],
+        disconnects: [],
+        conn: { writeBuffer, transport: { socket: { bufferedAmount } } },
+        emit(type, data) {
+            this.emitted.push([type, data]);
+        },
+        disconnect(close) {
+            this.disconnects.push(close);
+            this.connected = false;
+        },
+        ...overrides,
+    };
+}
+
+describe('createSocketIOPeer backpressure', () => {
+    const queued = (n, size = 1) => Array.from({ length: n }, () => ({ type: 'message', data: 'x'.repeat(size) }));
+    const tick = () => new Promise((resolve) => process.nextTick(resolve));
+
+    it('send over the ceiling closes the session and drops', async () => {
+        const socket = fakeSocketIO({ writeBuffer: queued(1, SIO_SEND_BUFFER_CEILING + 1) });
+        const peer = createSocketIOPeer(socket);
+
+        peer.send('signal', { signal: 'x', sender: 'peer-2' });
+
+        assert.equal(socket.emitted.length, 0, 'nothing may be queued behind the ceiling');
+        assert.deepEqual(socket.disconnects, [], 'never inside send: the disconnect handlers would run inside it');
+        await tick();
+        assert.deepEqual(socket.disconnects, [true], 'disconnect(true) closes the session too');
+    });
+
+    it("the websocket's unflushed bytes count toward the ceiling", async () => {
+        const socket = fakeSocketIO({ writeBuffer: queued(1), bufferedAmount: SIO_SEND_BUFFER_CEILING });
+        createSocketIOPeer(socket).send('signal', { signal: 'x' });
+        await tick();
+        assert.deepEqual(socket.disconnects, [true]);
+    });
+
+    // Two peers seated in one ordinary room over fake sockets whose
+    // disconnect(true) runs the 'disconnecting' listener (handleDisconnect)
+    // inside itself, as socket.io 4.8 does.
+    const seatedPair = () => {
+        const peers = {};
+        const fake = (id) => fakeSocketIO({
+            id,
+            disconnect(close) {
+                if (!this.connected) return;
+                this.disconnects.push(close);
+                handleDisconnect(peers[id]);
+                this.connected = false;
+            },
+        });
+        const a = fake('sio-a');
+        const b = fake('sio-b');
+        peers['sio-a'] = createSocketIOPeer(a, 'key-a');
+        peers['sio-b'] = createSocketIOPeer(b, 'key-b');
+        const roomId = randomUUID();
+        handleJoinRoom(peers['sio-a'], roomId);
+        handleJoinRoom(peers['sio-b'], roomId);
+        return { a, b, peers, roomId };
+    };
+
+    it('a peer that leaves while its partner is over the ceiling leaves no seat behind', async () => {
+        // Cut off inside send, the partner's own handleDisconnect ran inside
+        // the leaver's, and the outer one then put the partner back in the room
+        // it had just left: a dead seat and its roomMeta for the life of the
+        // process.
+        const { a, b, roomId } = seatedPair();
+        b.conn.writeBuffer = queued(SIO_SEND_QUEUE_CEILING + 1);
+
+        a.disconnect(true);
+        await tick();
+
+        assert.deepEqual(b.disconnects, [true], 'the partner over the ceiling is cut off');
+        assert.equal(rooms.has(roomId), false, 'no seat may outlive its disconnect');
+        assert.equal(roomMeta.has(roomId), false);
+    });
+
+    it('two peers both over the ceiling are each cut off once', async () => {
+        // Cut off inside send, each cut-off told the other peer, whose own
+        // cut-off ran inside it, and so on until the stack ran out: neither
+        // was cut off, and both stayed seated.
+        const { a, b, peers, roomId } = seatedPair();
+        a.conn.writeBuffer = queued(SIO_SEND_QUEUE_CEILING + 1);
+        b.conn.writeBuffer = queued(SIO_SEND_QUEUE_CEILING + 1);
+
+        handleSignal(peers['sio-a'], { candidate: 'c' }, 'sio-b');
+        await tick();
+        await tick();
+
+        assert.deepEqual(a.disconnects, [true]);
+        assert.deepEqual(b.disconnects, [true]);
+        assert.equal(rooms.has(roomId), false);
+    });
+
+    it('send at the ceiling still delivers', () => {
+        // Strictly greater-than, as on /ws.
+        const socket = fakeSocketIO({ writeBuffer: queued(1, SIO_SEND_BUFFER_CEILING) });
+        createSocketIOPeer(socket).send('signal', { signal: 'x', sender: 'peer-2' });
+        assert.deepEqual(socket.disconnects, []);
+        assert.deepEqual(socket.emitted, [['signal', { signal: 'x', sender: 'peer-2' }]]);
+    });
+
+    it('more packets than the queue ceiling close the session whatever their size', async () => {
+        const over = fakeSocketIO({ writeBuffer: queued(SIO_SEND_QUEUE_CEILING + 1) });
+        createSocketIOPeer(over).send('signal', { signal: 'x' });
+        await tick();
+        assert.deepEqual(over.disconnects, [true]);
+
+        const at = fakeSocketIO({ writeBuffer: queued(SIO_SEND_QUEUE_CEILING) });
+        createSocketIOPeer(at).send('signal', { signal: 'x' });
+        assert.deepEqual(at.disconnects, []);
+        assert.equal(at.emitted.length, 1);
+    });
+
+    it('a session whose engine.io fields are missing is never cut off', () => {
+        // A future engine.io may move these; the bound then switches off rather
+        // than refuse a peer that reads.
+        for (const conn of [undefined, {}, { writeBuffer: 'not an array', transport: null }]) {
+            const socket = fakeSocketIO({ conn });
+            createSocketIOPeer(socket).send('signal', { signal: 'x' });
+            assert.deepEqual(socket.disconnects, [], JSON.stringify(conn));
+            assert.equal(socket.emitted.length, 1, JSON.stringify(conn));
+        }
+    });
+
+    it('a socket already disconnected is not disconnected again', () => {
+        const socket = fakeSocketIO({ connected: false, writeBuffer: queued(1, SIO_SEND_BUFFER_CEILING + 1) });
+        createSocketIOPeer(socket).send('signal', { signal: 'x' });
+        assert.deepEqual(socket.disconnects, []);
+    });
+
+    it('the ceiling is one maxHttpBufferSize packet', () => {
+        // The same coupling as WS_SEND_BUFFER_CEILING and maxPayload above.
+        assert.equal(SIO_SEND_BUFFER_CEILING, 1e6);
+        const source = require('node:fs').readFileSync(require.resolve('./server.js'), 'utf8');
+        assert.match(source, /maxHttpBufferSize: 1e6/, 'maxHttpBufferSize must still be the 1 MB the ceiling mirrors');
     });
 });
 

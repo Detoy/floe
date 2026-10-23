@@ -2632,8 +2632,11 @@ function App() {
                                     <div className="space-y-4">
                                         {receiveRow}
                                         <div className="space-y-2">
-                                            <Eyebrow>Code or link</Eyebrow>
+                                            <Eyebrow>
+                                                <label htmlFor="floe-receive-code">Code or link</label>
+                                            </Eyebrow>
                                             <Input
+                                                id="floe-receive-code"
                                                 placeholder="amber-otter-cloud"
                                                 value={code}
                                                 onChange={(e) => { setCode(e.target.value); setPastedRequestLink(''); }}
@@ -2644,9 +2647,12 @@ function App() {
                                             />
                                         </div>
                                         <div className="space-y-2">
-                                            <Eyebrow>Save to</Eyebrow>
+                                            <Eyebrow>
+                                                <label htmlFor="floe-receive-save">Save to</label>
+                                            </Eyebrow>
                                             <div className="flex gap-2">
                                                 <Input
+                                                    id="floe-receive-save"
                                                     className="flex-1"
                                                     placeholder="Downloads (default)"
                                                     value={output}

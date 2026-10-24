@@ -3,9 +3,10 @@ import { resolveSocketUrl, peekSocketUrl, resetSocketUrlCache } from './socketUr
 
 const ORIGIN = 'https://floe.example.com';
 
-/** Minimal `window` stand-in: the resolver only ever reads location.origin. */
+/** Minimal `window` stand-in: the resolver reads location.origin, and
+ *  location.protocol for an address configured without a scheme. */
 function stubWindow(origin = ORIGIN) {
-    vi.stubGlobal('window', { location: { origin } });
+    vi.stubGlobal('window', { location: { origin, protocol: new URL(origin).protocol } });
 }
 
 function stubFetchJson(body: unknown, ok = true) {
@@ -78,6 +79,32 @@ describe('resolveSocketUrl', () => {
         stubFetchJson({ socketUrl: 'https://configured.example/' });
 
         await expect(resolveSocketUrl()).resolves.toBe('https://configured.example');
+    });
+
+    it('gives a configured address with no scheme the page scheme, as socket.io-client does', async () => {
+        stubWindow();
+        stubFetchJson({ socketUrl: '192.168.1.10:3001' });
+
+        await expect(resolveSocketUrl()).resolves.toBe('https://192.168.1.10:3001');
+    });
+
+    it('reads localhost:3001 as a host and a port, not as the scheme localhost:', async () => {
+        stubWindow('http://localhost:3000');
+        stubFetchJson({ socketUrl: 'localhost:3001/' });
+
+        await expect(resolveSocketUrl()).resolves.toBe('http://localhost:3001');
+    });
+
+    it.each([
+        'https://configured.example',
+        'HTTPS://configured.example',
+        'wss://configured.example',
+        '//configured.example',
+    ])('leaves %s as configured', async (value) => {
+        stubWindow();
+        stubFetchJson({ socketUrl: value });
+
+        await expect(resolveSocketUrl()).resolves.toBe(value);
     });
 
     it('falls back to the page origin when the configured value is empty', async () => {

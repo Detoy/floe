@@ -9,7 +9,7 @@ import {useState} from 'react';
 import {render, screen, within} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import {describe, expect, it} from 'vitest';
-import {FileSummary} from './TransferBits';
+import {FileSummary, ProgressRow} from './TransferBits';
 
 // A top-level component, not one declared inside a test body, so the harness
 // cannot remount what it is testing.
@@ -51,5 +51,32 @@ describe('FileSummary', () => {
         const row = screen.getByRole('button', {name: '1 item'});
         expect(row.getAttribute('type')).toBe('button');
         expect(row.getAttribute('aria-expanded')).toBe('false');
+    });
+});
+
+// ProgressRow is the send and receive bar; App.tsx passes it what track() built.
+describe('ProgressRow', () => {
+    it('reports its value and takes its name from the label beside it', () => {
+        // track() writes two spaces after the percent. An accessible name
+        // collapses runs of white space, so the name below has one.
+        const label = '[2/3] b.png - 42%  (4.2 MB / 10.0 MB), 1.5 MB/s, ETA 4s';
+        render(<ProgressRow prog={{pct: 42, label}}/>);
+
+        const bar = screen.getByRole('progressbar', {name: '[2/3] b.png - 42% (4.2 MB / 10.0 MB), 1.5 MB/s, ETA 4s'});
+        expect(bar.getAttribute('aria-valuemin')).toBe('0');
+        expect(bar.getAttribute('aria-valuemax')).toBe('100');
+        expect(bar.getAttribute('aria-valuenow')).toBe('42');
+    });
+
+    it('names each bar by its own label when two rows are on screen', () => {
+        render(
+            <>
+                <ProgressRow prog={{pct: 0, label: 'a.txt - 0%'}}/>
+                <ProgressRow prog={{pct: 100, label: 'b.png - 100%'}}/>
+            </>
+        );
+
+        expect(screen.getByRole('progressbar', {name: 'a.txt - 0%'}).getAttribute('aria-valuenow')).toBe('0');
+        expect(screen.getByRole('progressbar', {name: 'b.png - 100%'}).getAttribute('aria-valuenow')).toBe('100');
     });
 });

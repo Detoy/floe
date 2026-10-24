@@ -1,6 +1,6 @@
 // The pieces the send and receive consoles are assembled from.
 
-import type {CSSProperties} from 'react';
+import {useId, type CSSProperties} from 'react';
 import {AlertCircle, ChevronDown, CircleCheck, Files, Folder, Loader2, UploadCloud, X} from 'lucide-react';
 import {Button, cn} from './ui';
 import FileIcon from './FileIcon';
@@ -24,13 +24,24 @@ export function VerifiedMark({className}: {className: string}) {
 }
 
 export function ProgressRow({prog}: {prog: {pct: number; label: string}}) {
+    // The bar is named by the label beside it, as the web app's bars are.
+    // useId, not a fixed id like SUMMARY_LIST_ID below: App renders this row
+    // in two places, one for a send and one for a receive.
+    const labelId = useId();
     return (
         <div className="animate-floe-in space-y-2">
             <div className="flex items-baseline justify-between gap-3 font-mono text-[11px] text-zinc-400">
-                <span className="truncate">{prog.label}</span>
+                <span id={labelId} className="truncate">{prog.label}</span>
                 <span className="shrink-0 text-zinc-500">{prog.pct}%</span>
             </div>
-            <div className="h-1 w-full overflow-hidden rounded-full bg-white/10">
+            <div
+                role="progressbar"
+                aria-labelledby={labelId}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={prog.pct}
+                className="h-1 w-full overflow-hidden rounded-full bg-white/10"
+            >
                 <div
                     className="h-full rounded-full bg-white transition-[width] duration-150"
                     style={{width: `${prog.pct}%`}}

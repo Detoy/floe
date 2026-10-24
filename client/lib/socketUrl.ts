@@ -31,6 +31,19 @@ function normalize(url: string): string {
     return url.replace(/\/+$/, '');
 }
 
+/**
+ * A configured address with no scheme, such as 192.168.1.10:3001, takes the
+ * page's own. socket.io-client's url() already reads it that way for the
+ * realtime connection, and every fetch() built from the same base has to agree
+ * with it. A prefix test, never new URL(): URL parsing reads localhost:3001 as
+ * the scheme "localhost:". A value that starts with a slash, or with a scheme
+ * Socket.IO accepts, is left exactly as configured.
+ */
+function withPageScheme(url: string): string {
+    if (/^(?:\/|(?:https?|wss?):\/\/)/i.test(url)) return url;
+    return `${window.location.protocol}//${url}`;
+}
+
 async function fetchConfiguredUrl(): Promise<string> {
     try {
         // no-store matters three ways over: the service worker skips /api/, the
@@ -40,7 +53,7 @@ async function fetchConfiguredUrl(): Promise<string> {
         if (res.ok) {
             const { socketUrl } = await res.json();
             if (typeof socketUrl === 'string' && socketUrl.trim() !== '') {
-                return socketUrl.trim();
+                return withPageScheme(socketUrl.trim());
             }
         }
     } catch {

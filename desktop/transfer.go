@@ -1290,6 +1290,9 @@ func requestPromptFor(p requestPairing, in transfer.IncomingInfo, route string, 
 
 // nearestDir is dir, or its nearest parent that exists, or "".
 func nearestDir(dir string) string {
+	if dir == "" {
+		return "" // filepath.Clean("") is ".", the working directory
+	}
 	for d := filepath.Clean(dir); ; {
 		if dirExists(d) {
 			return d

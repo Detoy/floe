@@ -1148,9 +1148,16 @@ func TestAutoSpaceFnNamesWhyEveryDropAsks(t *testing.T) {
 			}
 		})
 	}
-	if got := autoSpaceFn(""); got != "" {
-		t.Fatalf("no save folder: %q, want nothing", got)
-	}
+	// No save folder: nothing to measure, so nothing to say. The drive under
+	// the floor would answer "low-space" if any folder were read.
+	t.Run("no save folder", func(t *testing.T) {
+		v := roomyVolume()
+		v.free = 3 * gib
+		v.install(t)
+		if got := autoSpaceFn(""); got != "" {
+			t.Fatalf("no save folder: %q, want nothing", got)
+		}
+	})
 }
 
 // TestWaitingLinkSaysItWillAsk (D-176): a link that accepts automatically on

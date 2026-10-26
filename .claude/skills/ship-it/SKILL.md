@@ -1,6 +1,6 @@
 ---
 name: 'ship-it'
-description: 'Land a change end to end: classify the CI lane, run the local checks CI would run, sign the commit from PowerShell (git commit -F), open the PR from a body file, wait for the CI green check by SHA, triage a stuck or red PR, squash-merge with explicit subject and body. Use for: commit this (even a checkpoint), open a PR, ship it, is CI green yet, the PR is stuck or red, merge it. Not for cutting a v* or desktop-v* release; that is floe-release.'
+description: 'Land a change end to end: classify the CI lane, run the local checks CI would run, sign the commit from PowerShell (git commit -F), open the PR from a body file, queue the squash-merge (auto-merge) with explicit subject, body and head SHA, wait for the CI green check by SHA, triage a stuck or red PR. Use for: commit this (even a checkpoint), open a PR, ship it, is CI green yet, the PR is stuck or red, merge it. Not for cutting a v* or desktop-v* release; that is floe-release.'
 ---
 
 # ship-it
@@ -93,6 +93,12 @@ arg(s)", so run those from the Bash tool.
 
 ## 6. Wait
 
+When you are shipping (step 0) and step 7's conditions hold, queue the merge before
+you wait, not after: GitHub then makes it the moment `CI green` passes, and this wait
+is for a red or a dropped run. Exit 0 then means the merge is made or about to be, and
+step 8 confirms it. For a status question ("is CI green yet"), wait only. Before you
+push a fix to a PR with a merge queued, run `gh pr merge <n> --disable-auto` (step 7).
+
 `node .claude/skills/ship-it/scripts/wait-ci.mjs <pr-number>` (either tool). Never
 pipe it (`| tail`, `| Select-Object`): the pipe's exit code replaces the script's, and
 a red run has read as green that way. Run it bare and read its last line. Docs
@@ -106,28 +112,82 @@ printed (a gate that completed as skipped or neutral counts as red); that comman
 answers "still in progress" until the WHOLE run has ended, not just the failed job.
 2 dropped event:
 run the printed `gh workflow run ci.yml --ref <branch>` once, then wait again (gh pr
-checks will not list dispatched jobs; this script reads check-runs by SHA). 3 timeout:
+checks will not list dispatched jobs; this script reads check-runs by SHA). Never for a
+pull request from a fork: its branch is not in this repository, and on a fork PR exit 2
+usually means a first-time contributor's run is held for approval
+(references/blocked-pr.md item 13), so do not run the printed command. 3 timeout:
 nothing failed, the script stopped waiting; run it again. 4: fix the target (see
 references/blocked-pr.md), do not retry. Anything else: references/blocked-pr.md.
 
 ## 7. Merge
 
-A step of its own, after the body file was written and read back (step 5).
+A step of its own, after the body file was written and read back (step 5). For a
+branch of this repository it does not wait for step 6 to end: since 2026-10-26 the
+repository allows auto-merge, so the merge is queued and GitHub makes it once
+`CI green` passes. A pull request from a fork waits for `CI green` first (below).
 
 `Skill test suites` has been in the gate's `needs` since 2026-10-13 and runs on every
 PR, so exit 0 from the wait covers it and no job is read by name any more.
 
 The ruleset does not require a branch to be up to date, so `CI green` on a PR says
 nothing about what merged after its branch was cut. In a series of PRs, branch each one
-after the one before it has merged, or merge `origin/main` into it and let the checks
-run again before merging.
+after the one before it has merged, and queue it only then. To bring a queued PR up to
+date: `gh pr merge <n> --disable-auto`, merge `origin/main` into it, push, and queue
+again at the new head.
 
-`gh pr merge <n> --squash --match-head-commit <full sha> --subject "<subject> (#<n>)" --body-file <same body file>`.
-The SHA is the head the checks ran on, read with
-`gh pr view <n> --json headRefOid --jq .headRefOid` and pasted, never typed: gh wants
-all 40 characters and refuses anything else. It makes the merge fail when the branch
-head is no longer the commit you checked (a bot rebased it, someone pushed), instead
-of merging whatever is there now. Pass the subject and body anyway so the result never
+Record the head before you read anything:
+`gh pr view <n> --json headRefOid --jq .headRefOid`. On a contributor's PR, read and test
+exactly that commit (`git fetch origin pull/<n>/head`, then diff that SHA, not a bare
+`gh pr diff`, which shows whatever the head is by then). Paste that recorded SHA, never a
+fresh read and never typed (gh wants all 40 characters), into:
+
+`gh pr merge <n> --auto --squash --match-head-commit <recorded sha> --subject "<subject> (#<n>)" --body-file <same body file>`.
+
+With `--auto`, gh merges at once when the PR can merge now (`mergeStateStatus` `CLEAN`,
+`HAS_HOOKS`, or `UNSTABLE`, which a red check outside the gate makes; gh 2.94.0,
+`isImmediatelyMergeable`), and otherwise queues the merge. GitHub then makes it, with the
+subject and body given here, the next time `CI green` passes on the head, a rerun
+included. Measured on #772 (2026-10-26, UTC): queued 13:03:13, `CI green` 13:15:00,
+merged 13:15:38 by the owner's account, with the subject (with `(#772)` once) and the
+body exactly as given. The push run of ci.yml on main started 13:15:42.
+
+- Queue only at a head you have read in full. A pull request from a branch of this
+  repository (yours once step 3 has passed, Dependabot's, Mintlify's) can be queued
+  before `CI green`: only people and apps with write access can push there.
+- A pull request from a fork is merged, not queued: run this step only after the review,
+  your own proof and a `CI green` on the recorded SHA, so gh merges at once (a fork PR is
+  `UNSTABLE` from its failing Vercel status) and GitHub's documented head check on the
+  merge applies. A queue on a fork PR would stay open to a push it does not cancel: its
+  author can update the branch from main without canceling it (GitHub changelog,
+  2021-03-22). Read every file at the recorded SHA, `.github/**` included, before
+  anything else: a fork's pull request runs its own copy of ci.yml, so its `CI green`
+  reports whatever that copy says. A first-time contributor's run waits for approval;
+  approve it only after that read.
+- GitHub refuses to queue at a SHA that is not the head: "expected head oid does not
+  match the current head oid (enablePullRequestAutoMerge)", with nothing queued
+  (measured on #773). So a push that lands between your read and the queue fails the
+  queue instead of being merged: read the new commits (references/blocked-pr.md item
+  11) and queue again.
+- Checks outside the gate never hold a queued merge. CodeQL analyzes the pull requests
+  from this repository's branches (yours, Dependabot's, Mintlify's), not forks, and
+  usually reports minutes before `CI green`. Read it before you queue or at step 8, and
+  treat a red one as a stop: `--disable-auto`, or a fix PR if it has merged. The Vercel
+  status fails on pull requests from forks (#767) and is no reason to hold.
+- After the queue, a push of new changes or a switch of base by someone without write
+  access cancels it, and the PR shows that auto-merge was disabled. GitHub documents no
+  cancel for a push by you or by a bot with write access (a Dependabot rebase, a
+  Mintlify commit), nor whether a queued merge stays held to the SHA it was given. So
+  before you push to a queued PR, run `gh pr merge <n> --disable-auto`, and queue again
+  at the new head, with the body file updated if the push changed what it says (a
+  polish commit on a contributor's PR adds the `Co-authored-by` line). Step 8 checks
+  what merged.
+- Never queue from a workflow: a merge made with a workflow's `GITHUB_TOKEN` starts no
+  push workflow, so main would get no CI run and no images.
+- `gh pr view <n> --json state,mergeStateStatus,autoMergeRequest` shows where it
+  stands; an open PR whose `autoMergeRequest` is null has nothing queued. A queued merge
+  that does not happen: references/blocked-pr.md item 13.
+
+Pass the subject and body every time, so the result never
 depends on the repo setting (it was
 COMMIT_MESSAGES until 2026-08-28, which concatenated every branch commit into the squash
 body). The subject is verbatim, so you add the (#n). A subject containing `"`, `$` or a
@@ -139,6 +199,17 @@ backtick goes through the Bash tool, as in step 5.
 exactly once (pull main in whichever checkout has it; a linked worktree cannot check it
 out). `gh api repos/{owner}/{repo}/branches/<branch>` returns 404 (auto-delete is on).
 `%G?` shows E on main: expected (web-flow GPG key), not a failure.
+
+After a queued merge, also check what merged:
+- `gh pr view <n> --json headRefOid,mergeCommit` names the head the squash was made
+  from, and it must be the SHA you queued at. If it is not, a push the queue did not
+  cancel landed (a bot's rebase, or an update from main), so read those commits now,
+  and revert them in a PR if they need it.
+- `gh run list --commit <squash sha>` shows the push run of ci.yml on main, which
+  starts within seconds of the merge, and images.yml as well when the merge touched
+  its paths (client/, server/, or the image pipeline's own files).
+- On a pull request from a branch of this repository, CodeQL's check on the merged
+  head is green.
 
 Done means merged, origin/main carries the squash commit, branch gone. CI green is a
 gate, not proof: the test plan carries what you actually checked. A green run proves the

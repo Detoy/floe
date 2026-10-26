@@ -1,6 +1,6 @@
 ---
 name: 'ship-it'
-description: 'Land a change end to end: classify the CI lane, run the local checks CI would run, sign the commit from PowerShell (git commit -F), open the PR from a body file, queue the squash-merge (auto-merge) with explicit subject, body and head SHA, wait for the CI green check by SHA, triage a stuck or red PR. Use for: commit this (even a checkpoint), open a PR, ship it, is CI green yet, the PR is stuck or red, merge it. Not for cutting a v* or desktop-v* release; that is floe-release.'
+description: 'Maintainer only. Land a change end to end: classify the CI lane, run the local checks CI would run, sign the commit from PowerShell (git commit -F), open the PR from a body file, queue the squash-merge (auto-merge) with explicit subject, body and head SHA, wait for the CI green check by SHA, triage a stuck or red PR. Use for: commit this (even a checkpoint), open a PR, ship it, is CI green yet, the PR is stuck or red, merge it. Not for cutting a v* or desktop-v* release; that is floe-release.'
 ---
 
 # ship-it
@@ -79,7 +79,8 @@ trailer (CLAUDE.md, Git Conventions).
 ## 5. Push and PR
 
 `git push -u origin <branch>` (either tool; no signing involved). Write the body file
-(## Summary, ## Test plan, no AI footer) with the Write tool, in a step of its own,
+(the sections of .github/PULL_REQUEST_TEMPLATE.md that apply, at least
+`## Summary` and `## Test plan`; no AI footer) with the Write tool, in a step of its own,
 and read it back before anything uses it. Then
 `gh pr create --title "<subject>" --body-file <file>`. Never put a file write and the
 command that consumes it in one batch of tool calls: on 2026-10-12 the write of a body

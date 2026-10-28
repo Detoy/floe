@@ -533,6 +533,40 @@ describe('the history store', () => {
         expect(screen.getByText('300 files')).toBeTruthy();
     });
 
+    // An empty file gets no recv:progress, only its recv:file-done.
+    async function codeReceive(user: ReturnType<typeof userEvent.setup>, events: () => void) {
+        let finish!: (dir: string) => void;
+        wails.go.ReceiveByCode.mockImplementation(() => new Promise<string>((resolve) => { finish = resolve; }));
+        mount();
+        await settled();
+        await user.click(screen.getAllByRole('button', {name: 'Receive'})[0]);
+        await user.type(screen.getByPlaceholderText('amber-otter-cloud'), 'amber-otter-cloud');
+        await user.click(screen.getAllByRole('button', {name: 'Receive'}).find((b) => b.className.includes('w-full'))!);
+        act(events);
+        await act(async () => { finish('C:\\dl'); });
+        await waitFor(() => expect(JSON.parse(localStorage.getItem('floe:history') || '[]')).toHaveLength(1));
+        return JSON.parse(localStorage.getItem('floe:history')!)[0];
+    }
+    const saved = (savedName: string, bytes: number) => wails.emit('recv:file-done', {savedName, bytes, verified: true});
+
+    it('a code receive keeps its empty files', async () => {
+        const row = await codeReceive(userEvent.setup(), () => {
+            saved('empty.txt', 0);
+            wails.emit('recv:progress', {fileName: 'notes.txt', fileIndex: 2, fileCount: 2, fileBytes: 5, fileSize: 5, totalBytes: 5, grandTotal: 5, savedName: 'notes.txt'});
+            saved('notes.txt', 5);
+        });
+        expect(row.names).toEqual(['empty.txt', 'notes.txt']);
+        expect(row.count).toBe(2);
+    });
+
+    it('one empty file received by code is named', async () => {
+        const user = userEvent.setup();
+        const row = await codeReceive(user, () => saved('empty.txt', 0));
+        expect(row.names).toEqual(['empty.txt']);
+        await user.click(screen.getByRole('button', {name: 'Open'}));
+        expect(wails.go.OpenFile).toHaveBeenCalledWith('C:\\dl', 'empty.txt');
+    });
+
     it('an expanded stored 300-name receive row lists 200 names', async () => {
         // A row stored before the cap still holds every name. Expanded, it
         // shows the first 200, as a new row does, so an old 100,000-name row

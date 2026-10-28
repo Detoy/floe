@@ -326,10 +326,11 @@ function App() {
     // restart has re-armed the UI, so its catch/finally must go quiet instead
     // of stomping the live attempt's state.
     const recvAttempt = useRef(0);
-    // Receive file names harvested from progress events, keyed by fileIndex
-    // (the Go throttle always emits each file's final update, so every name is
-    // captured). A Map, not an array: if the engine corrects a SavedName at
-    // commit time (a name collision surfaced by the final rename), the
+    // Receive file names, keyed by fileIndex: harvested from progress events,
+    // and from recv:file-done, which an empty file gets without any progress.
+    // Both senders number files 1 to N in commit order, so the count of
+    // recv:file-done events so far is the file's fileIndex. A Map, not an
+    // array: if the engine corrects a SavedName at commit time (a name collision surfaced by the final rename), the
     // corrected event must REPLACE the entry, or one file would count twice in
     // history and the single-file Open/Reveal buttons would vanish.
     const recvNamesRef = useRef<Map<number, string>>(new Map());
@@ -784,9 +785,10 @@ function App() {
     // listeners with a matching teardown and a first-render closure contract,
     // and it stays exactly as it is.
     useEffect(() => {
-        EventsOn('recv:file-done', (d: {verified: boolean}) => {
+        EventsOn('recv:file-done', (d: {savedName: string; verified: boolean}) => {
             if (recvCancel.current) return;
             recvFilesRef.current += 1;
+            if (d && d.savedName) recvNamesRef.current.set(recvFilesRef.current, d.savedName);
             if (d && d.verified) recvVerifiedRef.current += 1;
             setRecvVerified(recvFilesRef.current > 0 && recvVerifiedRef.current === recvFilesRef.current);
         });

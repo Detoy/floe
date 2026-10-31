@@ -194,6 +194,10 @@ await shot(
 );
 
 console.log('sender: creating the link');
+// Relay fallback off, after the staged shot shows it on: it keeps the sender's
+// 2 s wait before the first file (lib/relay.ts relayProbeDelayMs), the window
+// the receiver's waiting shot below is taken in.
+await sender.getByRole('checkbox', { name: /network relay fallback/i }).uncheck();
 await sender.locator('button', { hasText: /create secure link/i }).click();
 const linkEl = sender.locator('code').filter({ hasText: '#room=' });
 await linkEl.waitFor({ timeout: 20_000 });
@@ -211,7 +215,8 @@ await guardStats(recvCtx);
 const receiver = await recvCtx.newPage();
 await receiver.goto(roomUrl, { waitUntil: 'domcontentloaded' });
 // The pipeline plus the stats checkbox are only on screen until the first file
-// lands, and the sender waits about two seconds before sending. Capture fast.
+// lands, and with relay fallback off the sender waits about two seconds before
+// sending. Capture fast.
 await receiver.locator('text=Secure room joined').waitFor({ timeout: 30_000 });
 await receiver
     .locator('text=Contribute to global stats')

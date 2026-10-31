@@ -90,11 +90,21 @@ export async function sha256OfBlobUrl(page: Page, blobUrl: string): Promise<stri
     }, blobUrl);
 }
 
-/** Load the browser sender page, pick a file, and return the room URL. */
-export async function browserSenderSetup(page: Page, fixturePath: string): Promise<string> {
+/** Load the browser sender page, pick a file, and return the room URL.
+ *  `relayFallback: false` unticks Network relay fallback before Create, which
+ *  keeps the 2 s wait between the WebRTC connect and the first byte
+ *  (lib/relay.ts relayProbeDelayMs) for a test that acts inside it. */
+export async function browserSenderSetup(
+    page: Page,
+    fixturePath: string,
+    opts: { relayFallback?: boolean } = {}
+): Promise<string> {
     await page.goto('/');
     const fileInput = page.locator('input[type="file"]');
     await fileInput.setInputFiles(fixturePath);
+    if (opts.relayFallback === false) {
+        await page.getByRole('checkbox', { name: /network relay fallback/i }).uncheck();
+    }
     await page.locator('button', { hasText: /create secure link/i }).click();
     const linkEl = page.locator('code').filter({ hasText: '#room=' });
     await expect(linkEl).toBeVisible({ timeout: 10_000 });

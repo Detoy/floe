@@ -61,6 +61,20 @@ export function evaluateRelayGate(opts: {
     return { action: 'proceed' };
 }
 
+/**
+ * How long the main page's sender waits after the peers connect before it
+ * reads the route and runs evaluateRelayGate. The wait only matters where the
+ * route can change the verdict: with relay fallback on and the batch at most
+ * RELAY_SIZE_LIMIT (the gate's own comparison), a relayed and a direct route
+ * both proceed, so there is nothing to wait for and the send starts at once.
+ * Anywhere else the probe needs ICE to have nominated a pair first.
+ */
+export function relayProbeDelayMs(opts: { relayEnabled: boolean; totalSize: number }): number {
+    const { relayEnabled, totalSize } = opts;
+    if (relayEnabled && totalSize <= RELAY_SIZE_LIMIT) return 0;
+    return RELAY_PROBE_DELAY_MS;
+}
+
 /** probeIsRelay decides whether a live connection is running through the TURN
  *  relay, from an RTCStatsReport.
  *

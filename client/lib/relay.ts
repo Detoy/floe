@@ -7,6 +7,11 @@
 // checkRelayGate there), so a payload of exactly 2 GB is allowed.
 export const RELAY_SIZE_LIMIT = 2 * 1024 * 1024 * 1024; // 2 GB
 
+/** How long after the channel opens the relay probe reads the selected ICE
+ *  pair: long enough for ICE to nominate a pair, so the gate below reads the
+ *  route the transfer will actually take. */
+export const RELAY_PROBE_DELAY_MS = 2_000;
+
 /**
  * The ICE server list to hand SimplePeer. When the user keeps relay fallback on
  * (the default), every server is offered. When they turn it off, TURN servers

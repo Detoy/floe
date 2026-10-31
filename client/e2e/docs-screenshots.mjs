@@ -197,7 +197,10 @@ console.log('sender: creating the link');
 // Relay fallback off, after the staged shot shows it on: it keeps the sender's
 // 2 s wait before the first file (lib/relay.ts relayProbeDelayMs), the window
 // the receiver's waiting shot below is taken in.
-await sender.getByRole('checkbox', { name: /network relay fallback/i }).uncheck();
+await sender.getByText('Network relay fallback', { exact: true }).click();
+if (await sender.getByRole('checkbox', { name: /network relay fallback/i }).isChecked()) {
+    throw new Error('relay fallback is still on');
+}
 await sender.locator('button', { hasText: /create secure link/i }).click();
 const linkEl = sender.locator('code').filter({ hasText: '#room=' });
 await linkEl.waitFor({ timeout: 20_000 });

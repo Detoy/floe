@@ -103,7 +103,9 @@ export async function browserSenderSetup(
     const fileInput = page.locator('input[type="file"]');
     await fileInput.setInputFiles(fixturePath);
     if (opts.relayFallback === false) {
-        await page.getByRole('checkbox', { name: /network relay fallback/i }).uncheck();
+        // The input is sr-only, so click its label the way a person would.
+        await page.getByText('Network relay fallback', { exact: true }).click();
+        await expect(page.getByRole('checkbox', { name: /network relay fallback/i })).not.toBeChecked();
     }
     await page.locator('button', { hasText: /create secure link/i }).click();
     const linkEl = page.locator('code').filter({ hasText: '#room=' });
